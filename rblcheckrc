@@ -1,0 +1,10 @@
+-s bl.spamcop.net
+-s zen.spamhaus.org
+-s psbl.surriel.com
+-s blackholes.five-ten-sg.com
+-s spamsources.fabel.dk
+-s dnsbl-1.uceprotect.net
+-s dnsbl-2.uceprotect.net
+-s dnsbl-3.uceprotect.net
+-s ips.whitelisted.org
+#-s list.dnswl.org
