@@ -1,17 +1,19 @@
-use clap::{Parser, ArgGroup};
+use clap::{ArgGroup, Parser};
 use futures::stream::StreamExt;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::error::ResolveErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
 use std::net::IpAddr;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// A bulk DNS lookup tool.
 /// Reads items from stdin and resolves them concurrently.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-#[command(override_usage = "Required option missing: ruresol [OPTIONS] <-r|--reverse|-a|--address>")]
+#[command(
+    override_usage = "Required option missing: ruresol [OPTIONS] <-r|--reverse|-a|--address>"
+)]
 #[command(group(
     ArgGroup::new("mode")
         .required(true)
@@ -95,25 +97,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             do_ipv4 = true;
         }
 
-        async move {
-            process_entry(input, resolver, do_reverse, do_ipv4, do_ipv6).await
-        }
+        async move { process_entry(input, resolver, do_reverse, do_ipv4, do_ipv6).await }
     });
 
     // Execute with Concurrency Control
     // We switch between buffered (ordered) and buffer_unordered (immediate)
     if args.unordered {
-        tasks.buffer_unordered(args.concurrency).for_each(|result| async move {
-            if let Some(output) = result {
-                println!("{}", output);
-            }
-        }).await;
+        tasks
+            .buffer_unordered(args.concurrency)
+            .for_each(|result| async move {
+                if let Some(output) = result {
+                    println!("{}", output);
+                }
+            })
+            .await;
     } else {
-        tasks.buffered(args.concurrency).for_each(|result| async move {
-            if let Some(output) = result {
-                println!("{}", output);
-            }
-        }).await;
+        tasks
+            .buffered(args.concurrency)
+            .for_each(|result| async move {
+                if let Some(output) = result {
+                    println!("{}", output);
+                }
+            })
+            .await;
     }
 
     Ok(())
@@ -124,7 +130,7 @@ async fn process_entry(
     resolver: TokioAsyncResolver,
     do_reverse: bool,
     do_ipv4: bool,
-    do_ipv6: bool
+    do_ipv6: bool,
 ) -> Option<String> {
     if do_reverse {
         // Mode: Reverse Lookup (IP -> Hostname)
@@ -135,20 +141,16 @@ async fn process_entry(
                         return Some(format!("{}={}", input, name));
                     }
                     Some(format!("{}:No records found", input))
-                },
-                Err(e) => {
-                    match e.kind() {
-                        ResolveErrorKind::NoRecordsFound { response_code, .. } => {
-                            match response_code {
-                                ResponseCode::NXDomain => Some(format!("{}:NXDOMAIN", input)),
-                                ResponseCode::ServFail => Some(format!("{}:Temporary error", input)),
-                                _ => Some(format!("{}:No records found", input)),
-                            }
-                        },
-                        ResolveErrorKind::Timeout => Some(format!("{}:Temporary error", input)),
-                        _ => Some(format!("{}:Temporary error", input)),
-                    }
                 }
+                Err(e) => match e.kind() {
+                    ResolveErrorKind::NoRecordsFound { response_code, .. } => match response_code {
+                        ResponseCode::NXDomain => Some(format!("{}:NXDOMAIN", input)),
+                        ResponseCode::ServFail => Some(format!("{}:Temporary error", input)),
+                        _ => Some(format!("{}:No records found", input)),
+                    },
+                    ResolveErrorKind::Timeout => Some(format!("{}:Temporary error", input)),
+                    _ => Some(format!("{}:Temporary error", input)),
+                },
             }
         } else {
             Some(format!("{}:Invalid IP address format", input))
@@ -164,7 +166,7 @@ async fn process_entry(
                     for ip in lookup.iter() {
                         results.push(ip.to_string());
                     }
-                },
+                }
                 Err(e) => errors.push(e),
             }
         }
@@ -175,7 +177,7 @@ async fn process_entry(
                     for ip in lookup.iter() {
                         results.push(ip.to_string());
                     }
-                },
+                }
                 Err(e) => errors.push(e),
             }
         }
@@ -187,7 +189,7 @@ async fn process_entry(
 
         // If no results, analyze errors to determine the message
         if errors.is_empty() {
-             return Some(format!("{}:No records found", input));
+            return Some(format!("{}:No records found", input));
         }
 
         // Check Error Priority: NXDOMAIN > Temporary > NODATA
@@ -199,11 +201,11 @@ async fn process_entry(
                 ResolveErrorKind::NoRecordsFound { response_code, .. } => {
                     match response_code {
                         ResponseCode::NXDomain => has_nxdomain = true,
-                        ResponseCode::NoError => { /* This is NODATA */ },
+                        ResponseCode::NoError => { /* This is NODATA */ }
                         ResponseCode::ServFail => has_temp_error = true,
                         _ => has_temp_error = true,
                     }
-                },
+                }
                 ResolveErrorKind::Timeout => has_temp_error = true,
                 _ => has_temp_error = true,
             }
@@ -214,7 +216,7 @@ async fn process_entry(
         }
 
         if has_temp_error {
-             return Some(format!("{}:Temporary error", input));
+            return Some(format!("{}:Temporary error", input));
         }
 
         // If we are here, we only had NoRecordsFound with NoError (NODATA).
