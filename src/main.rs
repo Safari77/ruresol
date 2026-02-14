@@ -1,11 +1,16 @@
 use clap::{ArgGroup, Parser};
 use futures::stream::StreamExt;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::error::ResolveErrorKind;
+use hickory_resolver::ResolveErrorKind;
+use hickory_resolver::Resolver;
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+// TokioResolver type alias for convenience
+type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// A bulk DNS lookup tool.
 /// Reads items from stdin and resolves them concurrently.
@@ -62,7 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()?;
     opts.timeout = Duration::from_millis(args.timeout);
     opts.attempts = args.attempts;
-    let resolver = TokioAsyncResolver::tokio(config, opts);
+    let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+        .with_options(opts)
+        .build();
 
     // Setup Input Reading
     let stdin = tokio::io::stdin();
@@ -125,9 +132,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Classify a resolve error into an output message suffix.
+/// Returns the appropriate error string for the given ResolveError.
+fn classify_resolve_error(e: &hickory_resolver::ResolveError) -> &'static str {
+    match e.kind() {
+        ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
+            ProtoErrorKind::NoRecordsFound { response_code, .. } => match *response_code {
+                ResponseCode::NXDomain => "NXDOMAIN",
+                ResponseCode::ServFail => "Temporary error",
+                ResponseCode::NoError => "NODATA",
+                _ => "No records found",
+            },
+            ProtoErrorKind::Timeout => "Temporary error",
+            _ => "Temporary error",
+        },
+        _ => "Temporary error",
+    }
+}
+
 async fn process_entry(
     input: String,
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     do_reverse: bool,
     do_ipv4: bool,
     do_ipv6: bool,
@@ -142,15 +167,10 @@ async fn process_entry(
                     }
                     Some(format!("{}:No records found", input))
                 }
-                Err(e) => match e.kind() {
-                    ResolveErrorKind::NoRecordsFound { response_code, .. } => match response_code {
-                        ResponseCode::NXDomain => Some(format!("{}:NXDOMAIN", input)),
-                        ResponseCode::ServFail => Some(format!("{}:Temporary error", input)),
-                        _ => Some(format!("{}:No records found", input)),
-                    },
-                    ResolveErrorKind::Timeout => Some(format!("{}:Temporary error", input)),
-                    _ => Some(format!("{}:Temporary error", input)),
-                },
+                Err(e) => {
+                    let msg = classify_resolve_error(&e);
+                    Some(format!("{}:{}", input, msg))
+                }
             }
         } else {
             Some(format!("{}:Invalid IP address format", input))
@@ -198,15 +218,18 @@ async fn process_entry(
 
         for e in &errors {
             match e.kind() {
-                ResolveErrorKind::NoRecordsFound { response_code, .. } => {
-                    match response_code {
-                        ResponseCode::NXDomain => has_nxdomain = true,
-                        ResponseCode::NoError => { /* This is NODATA */ }
-                        ResponseCode::ServFail => has_temp_error = true,
-                        _ => has_temp_error = true,
+                ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
+                    ProtoErrorKind::NoRecordsFound { response_code, .. } => {
+                        match *response_code {
+                            ResponseCode::NXDomain => has_nxdomain = true,
+                            ResponseCode::NoError => { /* This is NODATA */ }
+                            ResponseCode::ServFail => has_temp_error = true,
+                            _ => has_temp_error = true,
+                        }
                     }
-                }
-                ResolveErrorKind::Timeout => has_temp_error = true,
+                    ProtoErrorKind::Timeout => has_temp_error = true,
+                    _ => has_temp_error = true,
+                },
                 _ => has_temp_error = true,
             }
         }

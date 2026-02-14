@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-hickory-resolver = { version = "*", features = ["system-config", "tokio-runtime"] }
+hickory-resolver = { version = "0.25", features = ["system-config", "tokio"] }
 futures = "0.3"
 async-stream = "0.3"
 
