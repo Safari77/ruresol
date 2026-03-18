@@ -2,13 +2,16 @@ use clap::{ArgGroup, Parser};
 use futures::stream::StreamExt;
 use hickory_resolver::ResolveErrorKind;
 use hickory_resolver::Resolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{
+    NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts,
+};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
-use std::net::IpAddr;
+use hickory_resolver::proto::xfer::Protocol;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 // TokioResolver type alias for convenience
 type TokioResolver = Resolver<TokioConnectionProvider>;
@@ -34,9 +37,13 @@ struct Args {
     #[arg(short = 'a', long)]
     address: bool,
 
-    /// Custom DNS resolver IP address (overrides system default)
+    /// Custom DNS resolvers (e.g., 8.8.8.8 or 127.0.0.1:5353). Can be used multiple times.
     #[arg(short = 'R', long)]
-    resolver: Option<IpAddr>,
+    resolver: Vec<String>,
+
+    /// Use DNS-over-HTTPS (Routes via Cloudflare's secure endpoint)
+    #[arg(long)]
+    doh: bool,
 
     /// Use IPv4 for address lookups (used with -a)
     #[arg(short = '4', long)]
@@ -62,6 +69,43 @@ struct Args {
     /// Output results as soon as they are ready (unordered), instead of preserving input order (default)
     #[arg(short = 'u', long)]
     unordered: bool,
+
+    /// Output results in JSON format
+    #[arg(short = 'j', long)]
+    json: bool,
+
+    /// Rate limit queries per second (QPS)
+    #[arg(long)]
+    rate_limit: Option<u64>,
+
+    /// Read inputs from a file instead of stdin. Use '-' to explicitly read from stdin.
+    #[arg(short = 'i', long)]
+    input: Option<String>,
+}
+
+/// Unified structure for handling outputs
+#[derive(serde::Serialize)]
+struct LookupResult {
+    query: String,
+    #[serde(skip_serializing)]
+    is_success: bool,
+    status: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    records: Vec<String>,
+}
+
+impl LookupResult {
+    fn print(&self, json_output: bool) {
+        if json_output {
+            if let Ok(json_str) = serde_json::to_string(self) {
+                println!("{}", json_str);
+            }
+        } else if self.is_success {
+            println!("{}={}", self.query, self.records.join(","));
+        } else {
+            println!("{}:{}", self.query, self.status);
+        }
+    }
 }
 
 #[tokio::main]
@@ -69,14 +113,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Initialize Resolver Config (Custom vs System Default)
-    let (config, mut opts) = match args.resolver {
-        Some(ip) => {
-            // Setup custom resolver pointing to the specified IP on standard port 53
-            let name_servers = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
-            let config = ResolverConfig::from_parts(None, vec![], name_servers);
-            (config, ResolverOpts::default())
+    let (config, mut opts) = if args.doh {
+        (ResolverConfig::cloudflare_https(), ResolverOpts::default())
+    } else if !args.resolver.is_empty() {
+        let mut nsg = NameServerConfigGroup::new();
+        for r in &args.resolver {
+            let addr: SocketAddr = if let Ok(ip) = r.parse::<IpAddr>() {
+                SocketAddr::new(ip, 53)
+            } else {
+                r.parse()
+                    .unwrap_or_else(|_| panic!("Invalid resolver format: {}. Use IP or IP:PORT", r))
+            };
+            nsg.push(NameServerConfig::new(addr, Protocol::Udp));
+            nsg.push(NameServerConfig::new(addr, Protocol::Tcp));
         }
-        None => hickory_resolver::system_conf::read_system_conf()?,
+        (ResolverConfig::from_parts(None, vec![], nsg), ResolverOpts::default())
+    } else {
+        hickory_resolver::system_conf::read_system_conf()?
     };
 
     // Apply custom timeouts and retries
@@ -88,14 +141,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // Setup Input Reading
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    let mut reader: Box<dyn AsyncBufRead + Unpin + Send> = if let Some(path) = &args.input {
+        if path == "-" {
+            Box::new(BufReader::new(tokio::io::stdin()))
+        } else {
+            let file = tokio::fs::File::open(path).await?;
+            Box::new(BufReader::new(file))
+        }
+    } else {
+        Box::new(BufReader::new(tokio::io::stdin()))
+    };
+
+    let mut interval =
+        args.rate_limit.map(|qps| tokio::time::interval(Duration::from_micros(1_000_000 / qps)));
 
     // manual UTF-8 check instead of lines()
     let input_stream = async_stream::stream! {
         let mut buf = Vec::new();
         while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf).await {
             if bytes_read == 0 { break; } // EOF
+
+            if let Some(i) = &mut interval {
+                i.tick().await;
+            }
 
             // Check if valid UTF-8. If valid, process. If not, we basically ignore (skip) it.
             if let Ok(line_str) = std::str::from_utf8(&buf) {
@@ -112,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tasks = input_stream.map(|input| {
         let resolver = resolver.clone();
         let do_reverse = args.reverse;
-
         let mut do_ipv4 = args.ipv4;
         let do_ipv6 = args.ipv6;
 
@@ -123,24 +190,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         async move { process_entry(input, resolver, do_reverse, do_ipv4, do_ipv6).await }
     });
 
+    let json_mode = args.json;
+
     // Execute with Concurrency Control
     // We switch between buffered (ordered) and buffer_unordered (immediate)
     if args.unordered {
         tasks
             .buffer_unordered(args.concurrency)
             .for_each(|result| async move {
-                if let Some(output) = result {
-                    println!("{}", output);
-                }
+                result.print(json_mode);
             })
             .await;
     } else {
         tasks
             .buffered(args.concurrency)
             .for_each(|result| async move {
-                if let Some(output) = result {
-                    println!("{}", output);
-                }
+                result.print(json_mode);
             })
             .await;
     }
@@ -172,24 +237,41 @@ async fn process_entry(
     do_reverse: bool,
     do_ipv4: bool,
     do_ipv6: bool,
-) -> Option<String> {
+) -> LookupResult {
     if do_reverse {
         // Mode: Reverse Lookup (IP -> Hostname)
         if let Ok(ip) = input.parse::<IpAddr>() {
             match resolver.reverse_lookup(ip).await {
                 Ok(lookup) => {
                     if let Some(name) = lookup.iter().next() {
-                        return Some(format!("{}={}", input, name));
+                        return LookupResult {
+                            query: input,
+                            is_success: true,
+                            status: "SUCCESS".to_string(),
+                            records: vec![name.to_string()],
+                        };
                     }
-                    Some(format!("{}:No records found", input))
+                    LookupResult {
+                        query: input,
+                        is_success: false,
+                        status: "No records found".to_string(),
+                        records: vec![],
+                    }
                 }
-                Err(e) => {
-                    let msg = classify_resolve_error(&e);
-                    Some(format!("{}:{}", input, msg))
-                }
+                Err(e) => LookupResult {
+                    query: input,
+                    is_success: false,
+                    status: classify_resolve_error(&e).to_string(),
+                    records: vec![],
+                },
             }
         } else {
-            Some(format!("{}:Invalid IP address format", input))
+            LookupResult {
+                query: input,
+                is_success: false,
+                status: "Invalid IP address format".to_string(),
+                records: vec![],
+            }
         }
     } else {
         // Mode: Forward Lookup (Hostname -> IP)
@@ -220,12 +302,22 @@ async fn process_entry(
 
         // If we found any records, return them (Success)
         if !results.is_empty() {
-            return Some(format!("{}={}", input, results.join(",")));
+            return LookupResult {
+                query: input,
+                is_success: true,
+                status: "SUCCESS".to_string(),
+                records: results,
+            };
         }
 
         // If no results, analyze errors to determine the message
         if errors.is_empty() {
-            return Some(format!("{}:No records found", input));
+            return LookupResult {
+                query: input,
+                is_success: false,
+                status: "No records found".to_string(),
+                records: vec![],
+            };
         }
 
         // Check Error Priority: NXDOMAIN > Temporary > NODATA
@@ -243,28 +335,29 @@ async fn process_entry(
                             _ => has_temp_error = true,
                         }
                     }
-                    ProtoErrorKind::Timeout => has_temp_error = true,
                     _ => has_temp_error = true,
                 },
                 _ => has_temp_error = true,
             }
         }
 
-        if has_nxdomain {
-            return Some(format!("{}:NXDOMAIN", input));
-        }
-
-        if has_temp_error {
-            return Some(format!("{}:Temporary error", input));
-        }
-
-        // If we are here, we only had NoRecordsFound with NoError (NODATA).
-        if do_ipv4 && !do_ipv6 {
-            Some(format!("{}:No A records found", input))
+        let status = if has_nxdomain {
+            "NXDOMAIN"
+        } else if has_temp_error {
+            "Temporary error"
+        } else if do_ipv4 && !do_ipv6 {
+            "No A records found"
         } else if do_ipv6 && !do_ipv4 {
-            Some(format!("{}:No AAAA records found", input))
+            "No AAAA records found"
         } else {
-            Some(format!("{}:No records found", input))
+            "No records found"
+        };
+
+        LookupResult {
+            query: input,
+            is_success: false,
+            status: status.to_string(),
+            records: vec![],
         }
     }
 }
