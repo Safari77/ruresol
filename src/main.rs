@@ -2,6 +2,7 @@ use clap::{ArgGroup, Parser};
 use futures::stream::StreamExt;
 use hickory_resolver::ResolveErrorKind;
 use hickory_resolver::Resolver;
+use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
@@ -33,6 +34,10 @@ struct Args {
     #[arg(short = 'a', long)]
     address: bool,
 
+    /// Custom DNS resolver IP address (overrides system default)
+    #[arg(short = 'R', long)]
+    resolver: Option<IpAddr>,
+
     /// Use IPv4 for address lookups (used with -a)
     #[arg(short = '4', long)]
     ipv4: bool,
@@ -50,7 +55,7 @@ struct Args {
     timeout: u64,
 
     /// Number of attempts (retries) before giving up.
-    /// Note: Total timeout ≈ timeout * attempts * (number of nameservers).
+    /// Note: Total timeout \u2248 timeout * attempts * (number of nameservers).
     #[arg(long, default_value_t = 2)]
     attempts: usize,
 
@@ -63,10 +68,21 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Initialize Resolver with Custom Timeout
-    let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()?;
+    // Initialize Resolver Config (Custom vs System Default)
+    let (config, mut opts) = match args.resolver {
+        Some(ip) => {
+            // Setup custom resolver pointing to the specified IP on standard port 53
+            let name_servers = NameServerConfigGroup::from_ips_clear(&[ip], 53, true);
+            let config = ResolverConfig::from_parts(None, vec![], name_servers);
+            (config, ResolverOpts::default())
+        }
+        None => hickory_resolver::system_conf::read_system_conf()?,
+    };
+
+    // Apply custom timeouts and retries
     opts.timeout = Duration::from_millis(args.timeout);
     opts.attempts = args.attempts;
+
     let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
         .with_options(opts)
         .build();
