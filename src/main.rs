@@ -10,10 +10,12 @@ use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::proto::xfer::Protocol;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 // TokioResolver type alias for convenience
@@ -95,6 +97,22 @@ struct Args {
     /// Extra domains to resolve (specified after --)
     #[arg(last = true)]
     extra: Vec<String>,
+
+    /// Show progress bar and live query statistics on stderr
+    #[arg(long)]
+    progress: bool,
+
+    /// Only print record values (no query name, no type prefix). Errors are suppressed.
+    #[arg(long)]
+    short: bool,
+
+    /// Print query statistics summary after completion
+    #[arg(long)]
+    stats: bool,
+
+    /// Include TTL in JSON output (only effective with --json)
+    #[arg(long)]
+    ttl: bool,
 }
 
 /// Parse and validate the --type argument (case-insensitive)
@@ -127,6 +145,162 @@ fn to_record_type(qt: &str) -> RecordType {
     }
 }
 
+// ─── RTT / Query Statistics ─────────────────────────────────────────────────
+
+/// Tracks per-query RTT for min/avg/max/mdev calculation
+struct RttTracker {
+    count: u64,
+    min_ms: f64,
+    max_ms: f64,
+    sum_ms: f64,
+    sum_sq_ms: f64,
+}
+
+impl RttTracker {
+    fn new() -> Self {
+        Self { count: 0, min_ms: f64::MAX, max_ms: 0.0, sum_ms: 0.0, sum_sq_ms: 0.0 }
+    }
+
+    fn record(&mut self, duration: Duration) {
+        let ms = duration.as_secs_f64() * 1000.0;
+        self.count += 1;
+        if ms < self.min_ms {
+            self.min_ms = ms;
+        }
+        if ms > self.max_ms {
+            self.max_ms = ms;
+        }
+        self.sum_ms += ms;
+        self.sum_sq_ms += ms * ms;
+    }
+
+    fn avg_ms(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.sum_ms / self.count as f64
+    }
+
+    /// Population standard deviation of RTT
+    fn mdev_ms(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let mean = self.avg_ms();
+        let variance = (self.sum_sq_ms / self.count as f64) - (mean * mean);
+        // Guard against tiny negative values from floating-point imprecision
+        if variance < 0.0 { 0.0 } else { variance.sqrt() }
+    }
+
+    fn format_rtt(&self) -> String {
+        if self.count == 0 {
+            return "-/-/-/- ms".to_string();
+        }
+        format!(
+            "{:.1}/{:.1}/{:.1}/{:.1} ms",
+            self.min_ms,
+            self.avg_ms(),
+            self.max_ms,
+            self.mdev_ms()
+        )
+    }
+}
+
+/// Shared query statistics (thread-safe)
+struct QueryStats {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    errors: AtomicU64,
+    bytes_read: AtomicU64,
+    eof_reached: AtomicBool,
+    file_input: bool, // true if -i with a regular file (known size)
+    start: Instant,
+    rtt: Mutex<RttTracker>,
+}
+
+impl QueryStats {
+    fn new(file_input: bool) -> Self {
+        Self {
+            submitted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            eof_reached: AtomicBool::new(false),
+            file_input,
+            start: Instant::now(),
+            rtt: Mutex::new(RttTracker::new()),
+        }
+    }
+
+    fn record_completion(&self, is_success: bool, duration: Duration) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        if !is_success {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Ok(mut rtt) = self.rtt.lock() {
+            rtt.record(duration);
+        }
+    }
+
+    fn qps(&self) -> f64 {
+        let completed = self.completed.load(Ordering::Relaxed) as f64;
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if elapsed < 0.001 { 0.0 } else { completed / elapsed }
+    }
+
+    /// Format a progress message with live statistics
+    fn format_progress(&self) -> String {
+        let completed = self.completed.load(Ordering::Relaxed);
+        let submitted = self.submitted.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let eof = self.eof_reached.load(Ordering::Relaxed);
+
+        let total_str =
+            if self.file_input || eof { format!("{}", submitted) } else { "?".to_string() };
+
+        let rtt_str =
+            if let Ok(rtt) = self.rtt.lock() { rtt.format_rtt() } else { "-/-/-/- ms".to_string() };
+
+        format!(
+            "Q: {}/{} E: {} | {:.1} q/s | RTT {}",
+            completed,
+            total_str,
+            errors,
+            self.qps(),
+            rtt_str
+        )
+    }
+
+    /// Format a final statistics summary for --stats
+    fn format_summary(&self) -> String {
+        let completed = self.completed.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let succeeded = completed - errors;
+        let elapsed = self.start.elapsed();
+
+        let rtt_str =
+            if let Ok(rtt) = self.rtt.lock() { rtt.format_rtt() } else { "-/-/-/- ms".to_string() };
+
+        format!(
+            "\n--- Query Statistics ---\n\
+             Queries:   {}\n\
+             Succeeded: {}\n\
+             Errors:    {}\n\
+             Elapsed:   {:.1}s\n\
+             QPS:       {:.1} q/s\n\
+             RTT:       {} (min/avg/max/mdev)",
+            completed,
+            succeeded,
+            errors,
+            elapsed.as_secs_f64(),
+            self.qps(),
+            rtt_str
+        )
+    }
+}
+
+// ─── Record / Result types ──────────────────────────────────────────────────
+
 /// A single record entry, either a plain value or a value with priority (for MX)
 #[derive(serde::Serialize, Clone)]
 #[serde(untagged)]
@@ -158,10 +332,30 @@ struct LookupResult {
     status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     records: Vec<RecordEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<u32>,
 }
 
 impl LookupResult {
-    fn print(&self, json_output: bool) {
+    fn print(&self, json_output: bool, short: bool) {
+        if short {
+            // --short: only print values for successful lookups, one per line
+            if !self.is_success {
+                return;
+            }
+            for record in &self.records {
+                match record {
+                    RecordEntry::WithPriority { priority, value } => {
+                        println!("{} {}", priority, value);
+                    }
+                    RecordEntry::Simple(value) => {
+                        println!("{}", value);
+                    }
+                }
+            }
+            return;
+        }
+
         if json_output {
             if let Ok(json_str) = serde_json::to_string(self) {
                 println!("{}", json_str);
@@ -225,6 +419,8 @@ fn build_effective_types(args: &Args) -> (Vec<String>, bool) {
     (types, is_legacy)
 }
 
+// ─── Main ───────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -272,6 +468,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_options(opts)
         .build();
 
+    // Determine file size for progress bar (if -i points to a regular file)
+    let (file_size, is_regular_file) = if let Some(path) = &args.input {
+        if path != "-" {
+            match tokio::fs::metadata(path).await {
+                Ok(meta) if meta.is_file() => (meta.len(), true),
+                _ => (0, false),
+            }
+        } else {
+            (0, false)
+        }
+    } else {
+        (0, false)
+    };
+
     // Setup Input Reading (None when --no-stdin and no -i file)
     let mut reader: Option<Box<dyn AsyncBufRead + Unpin + Send>> = if let Some(path) = &args.input {
         if path == "-" {
@@ -293,6 +503,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extra_domains: Vec<String> =
         args.extra.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
+    // Initialize statistics tracking (used by --progress and --stats)
+    let stats = Arc::new(QueryStats::new(is_regular_file));
+
+    // Initialize progress bar (if --progress)
+    let progress_bar: Option<ProgressBar> = if args.progress {
+        let pb = if is_regular_file && file_size > 0 {
+            let pb = ProgressBar::new(file_size);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{bar:30.cyan/blue} {percent:>3}% | {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar())
+                    .progress_chars("█▓░"),
+            );
+            pb
+        } else {
+            // Pipe / stdin / unknown size: use spinner
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.cyan} {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+            );
+            pb
+        };
+        pb.enable_steady_tick(Duration::from_millis(100));
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Clone handles for the input stream
+    let stats_stream = stats.clone();
+    let pb_stream = progress_bar.clone();
+
     // manual UTF-8 check instead of lines()
     let input_stream = async_stream::stream! {
         // First yield extra domains from command line (after --)
@@ -307,7 +551,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref mut reader) = reader {
             let mut buf = Vec::new();
             while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf).await {
-                if bytes_read == 0 { break; } // EOF
+                if bytes_read == 0 {
+                    stats_stream.eof_reached.store(true, Ordering::Relaxed);
+                    break;
+                } // EOF
+
+                stats_stream.bytes_read.fetch_add(bytes_read as u64, Ordering::Relaxed);
+                if let Some(ref pb) = pb_stream {
+                    if is_regular_file {
+                        pb.set_position(stats_stream.bytes_read.load(Ordering::Relaxed));
+                    }
+                }
 
                 if let Some(i) = &mut interval {
                     i.tick().await;
@@ -323,6 +577,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buf.clear();
             }
         }
+
+        // If no reader, mark EOF immediately (only -- args)
+        if reader.is_none() {
+            stats_stream.eof_reached.store(true, Ordering::Relaxed);
+        }
     };
 
     let is_reverse = args.reverse;
@@ -330,6 +589,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let do_ipv6 = args.ipv6;
     let effective_types = Arc::new(effective_types);
     let json_mode = args.json;
+    let short_mode = args.short;
+    let include_ttl = args.ttl && args.json; // TTL only meaningful with --json
 
     // Expand each input into one work item per query type (or one reverse item).
     // This gives fine-grained concurrency control: each (input, type) pair is one task.
@@ -348,33 +609,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         futures::stream::iter(pairs)
     });
 
+    // Clone handles for the task closures
+    let stats_task = stats.clone();
+    let pb_task = progress_bar.clone();
+
     let tasks = work_stream.map(move |(input, work_type)| {
         let resolver = resolver.clone();
+        let stats = stats_task.clone();
+        let pb = pb_task.clone();
+
+        stats.submitted.fetch_add(1, Ordering::Relaxed);
+
         async move {
-            match work_type.as_str() {
-                "__REVERSE__" => reverse_lookup(input, resolver).await,
-                "__LEGACY__" => legacy_forward_lookup(input, resolver, do_ipv4, do_ipv6).await,
-                qt => typed_lookup(input, resolver, qt).await,
+            let start = Instant::now();
+            let result = match work_type.as_str() {
+                "__REVERSE__" => reverse_lookup(input, resolver, include_ttl).await,
+                "__LEGACY__" => {
+                    legacy_forward_lookup(input, resolver, do_ipv4, do_ipv6, include_ttl).await
+                }
+                qt => typed_lookup(input, resolver, qt, include_ttl).await,
+            };
+            let elapsed = start.elapsed();
+
+            stats.record_completion(result.is_success, elapsed);
+            if let Some(ref pb) = pb {
+                pb.set_message(stats.format_progress());
             }
+
+            result
         }
     });
+
+    // Clone handles for the output closure
+    let pb_output = progress_bar.clone();
 
     // Execute with Concurrency Control
     // We switch between buffered (ordered) and buffer_unordered (immediate)
     if args.unordered {
         tasks
             .buffer_unordered(args.concurrency)
-            .for_each(|result| async move {
-                result.print(json_mode);
+            .for_each(|result| {
+                let pb = pb_output.clone();
+                async move {
+                    if let Some(ref pb) = pb {
+                        pb.suspend(|| result.print(json_mode, short_mode));
+                    } else {
+                        result.print(json_mode, short_mode);
+                    }
+                }
             })
             .await;
     } else {
         tasks
             .buffered(args.concurrency)
-            .for_each(|result| async move {
-                result.print(json_mode);
+            .for_each(|result| {
+                let pb = pb_output.clone();
+                async move {
+                    if let Some(ref pb) = pb {
+                        pb.suspend(|| result.print(json_mode, short_mode));
+                    } else {
+                        result.print(json_mode, short_mode);
+                    }
+                }
             })
             .await;
+    }
+
+    // Finish progress bar
+    if let Some(ref pb) = progress_bar {
+        pb.set_message(stats.format_progress());
+        pb.finish_and_clear();
+    }
+
+    // Print statistics summary (--stats)
+    if args.stats {
+        eprintln!("{}", stats.format_summary());
     }
 
     Ok(())
@@ -398,8 +707,32 @@ fn classify_resolve_error(e: &hickory_resolver::ResolveError) -> &'static str {
     }
 }
 
+/// Fetch minimum TTL for a given name and record type via generic lookup.
+/// Uses the resolver cache, so this won't cause an extra network round-trip
+/// when called right after a typed lookup for the same name/type.
+async fn fetch_ttl(
+    resolver: &TokioResolver,
+    name: &str,
+    record_type: RecordType,
+    include_ttl: bool,
+) -> Option<u32> {
+    if !include_ttl {
+        return None;
+    }
+    resolver
+        .lookup(name, record_type)
+        .await
+        .ok()
+        .and_then(|l| l.record_iter().map(|r| r.ttl()).min())
+}
+
 /// Helper: build a successful typed LookupResult
-fn typed_success(input: String, qt_lower: String, records: Vec<RecordEntry>) -> LookupResult {
+fn typed_success(
+    input: String,
+    qt_lower: String,
+    records: Vec<RecordEntry>,
+    ttl: Option<u32>,
+) -> LookupResult {
     LookupResult {
         query: input,
         query_type: qt_lower,
@@ -411,6 +744,7 @@ fn typed_success(input: String, qt_lower: String, records: Vec<RecordEntry>) -> 
             "SUCCESS".to_string()
         },
         records,
+        ttl,
     }
 }
 
@@ -427,14 +761,18 @@ fn typed_error(
         is_typed_query: true,
         status: classify_resolve_error(e).to_string(),
         records: vec![],
+        ttl: None,
     }
 }
 
 /// Reverse lookup (IP -> Hostname), legacy output format
-async fn reverse_lookup(input: String, resolver: TokioResolver) -> LookupResult {
+async fn reverse_lookup(input: String, resolver: TokioResolver, include_ttl: bool) -> LookupResult {
     if let Ok(ip) = input.parse::<IpAddr>() {
         match resolver.reverse_lookup(ip).await {
             Ok(lookup) => {
+                // TTL extraction for reverse lookups is not supported (would need arpa name construction)
+                let ttl: Option<u32> = None;
+                let _ = include_ttl;
                 if let Some(name) = lookup.iter().next() {
                     return LookupResult {
                         query: input,
@@ -443,6 +781,7 @@ async fn reverse_lookup(input: String, resolver: TokioResolver) -> LookupResult 
                         is_typed_query: false,
                         status: "SUCCESS".to_string(),
                         records: vec![RecordEntry::Simple(name.to_string())],
+                        ttl,
                     };
                 }
                 LookupResult {
@@ -452,6 +791,7 @@ async fn reverse_lookup(input: String, resolver: TokioResolver) -> LookupResult 
                     is_typed_query: false,
                     status: "No records found".to_string(),
                     records: vec![],
+                    ttl: None,
                 }
             }
             Err(e) => LookupResult {
@@ -461,6 +801,7 @@ async fn reverse_lookup(input: String, resolver: TokioResolver) -> LookupResult 
                 is_typed_query: false,
                 status: classify_resolve_error(&e).to_string(),
                 records: vec![],
+                ttl: None,
             },
         }
     } else {
@@ -471,6 +812,7 @@ async fn reverse_lookup(input: String, resolver: TokioResolver) -> LookupResult 
             is_typed_query: false,
             status: "Invalid IP address format".to_string(),
             records: vec![],
+            ttl: None,
         }
     }
 }
@@ -481,9 +823,11 @@ async fn legacy_forward_lookup(
     resolver: TokioResolver,
     do_ipv4: bool,
     do_ipv6: bool,
+    include_ttl: bool,
 ) -> LookupResult {
     let mut results = Vec::new();
     let mut errors = Vec::new();
+    let mut min_ttl: Option<u32> = None;
 
     let qt_label = if do_ipv4 && do_ipv6 {
         "a+aaaa"
@@ -496,6 +840,13 @@ async fn legacy_forward_lookup(
     if do_ipv4 {
         match resolver.ipv4_lookup(&input).await {
             Ok(lookup) => {
+                if include_ttl {
+                    let ttl = fetch_ttl(&resolver, &input, RecordType::A, true).await;
+                    min_ttl = match (min_ttl, ttl) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
                 for ip in lookup.iter() {
                     results.push(RecordEntry::Simple(ip.to_string()));
                 }
@@ -507,6 +858,13 @@ async fn legacy_forward_lookup(
     if do_ipv6 {
         match resolver.ipv6_lookup(&input).await {
             Ok(lookup) => {
+                if include_ttl {
+                    let ttl = fetch_ttl(&resolver, &input, RecordType::AAAA, true).await;
+                    min_ttl = match (min_ttl, ttl) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
                 for ip in lookup.iter() {
                     results.push(RecordEntry::Simple(ip.to_string()));
                 }
@@ -524,6 +882,7 @@ async fn legacy_forward_lookup(
             is_typed_query: false,
             status: "SUCCESS".to_string(),
             records: results,
+            ttl: min_ttl,
         };
     }
 
@@ -536,6 +895,7 @@ async fn legacy_forward_lookup(
             is_typed_query: false,
             status: "No records found".to_string(),
             records: vec![],
+            ttl: None,
         };
     }
 
@@ -579,32 +939,41 @@ async fn legacy_forward_lookup(
         is_typed_query: false,
         status: status.to_string(),
         records: vec![],
+        ttl: None,
     }
 }
 
 /// Perform a typed DNS lookup for --type queries (new output format)
-async fn typed_lookup(input: String, resolver: TokioResolver, query_type: &str) -> LookupResult {
+async fn typed_lookup(
+    input: String,
+    resolver: TokioResolver,
+    query_type: &str,
+    include_ttl: bool,
+) -> LookupResult {
     let qt_lower = query_type.to_lowercase();
 
     match query_type {
         "A" => match resolver.ipv4_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::A, include_ttl).await;
                 let records: Vec<RecordEntry> =
                     lookup.iter().map(|ip| RecordEntry::Simple(ip.to_string())).collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "AAAA" => match resolver.ipv6_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::AAAA, include_ttl).await;
                 let records: Vec<RecordEntry> =
                     lookup.iter().map(|ip| RecordEntry::Simple(ip.to_string())).collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "MX" => match resolver.mx_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::MX, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
                     .iter()
                     .map(|mx| RecordEntry::WithPriority {
@@ -612,28 +981,31 @@ async fn typed_lookup(input: String, resolver: TokioResolver, query_type: &str) 
                         value: mx.exchange().to_string(),
                     })
                     .collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "NS" => match resolver.ns_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::NS, include_ttl).await;
                 let records: Vec<RecordEntry> =
                     lookup.iter().map(|ns| RecordEntry::Simple(ns.0.to_string())).collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "TXT" => match resolver.txt_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::TXT, include_ttl).await;
                 let records: Vec<RecordEntry> =
                     lookup.iter().map(|txt| RecordEntry::Simple(txt.to_string())).collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "SOA" => match resolver.soa_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SOA, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
                     .iter()
                     .map(|soa| {
@@ -649,12 +1021,13 @@ async fn typed_lookup(input: String, resolver: TokioResolver, query_type: &str) 
                         ))
                     })
                     .collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         "SRV" => match resolver.srv_lookup(input.as_str()).await {
             Ok(lookup) => {
+                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SRV, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
                     .iter()
                     .map(|srv| {
@@ -667,20 +1040,26 @@ async fn typed_lookup(input: String, resolver: TokioResolver, query_type: &str) 
                         ))
                     })
                     .collect();
-                typed_success(input, qt_lower, records)
+                typed_success(input, qt_lower, records, ttl)
             }
             Err(e) => typed_error(input, qt_lower, &e),
         },
         // Generic lookup for CAA, DNSKEY, DS, HTTPS, PTR, TLSA
+        // resolver.lookup() returns Lookup directly, so we extract TTL inline
         _ => {
             let record_type = to_record_type(query_type);
             match resolver.lookup(input.as_str(), record_type).await {
                 Ok(lookup) => {
+                    let ttl = if include_ttl {
+                        lookup.record_iter().map(|r| r.ttl()).min()
+                    } else {
+                        None
+                    };
                     let records: Vec<RecordEntry> = lookup
                         .record_iter()
                         .map(|r| RecordEntry::Simple(r.data().to_string()))
                         .collect();
-                    typed_success(input, qt_lower, records)
+                    typed_success(input, qt_lower, records, ttl)
                 }
                 Err(e) => typed_error(input, qt_lower, &e),
             }
