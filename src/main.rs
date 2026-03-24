@@ -113,6 +113,11 @@ struct Args {
     /// Include TTL in JSON output (only effective with --json)
     #[arg(long)]
     ttl: bool,
+
+    /// Only show results matching these statuses. Can be specified multiple times.
+    /// Allowed: SUCCESS, NXDOMAIN, NODATA, TEMP
+    #[arg(long = "show-only", value_parser = parse_show_filter)]
+    show_only: Vec<String>,
 }
 
 /// Parse and validate the --type argument (case-insensitive)
@@ -122,6 +127,31 @@ fn parse_query_type(s: &str) -> Result<String, String> {
         Ok(upper)
     } else {
         Err(format!("Invalid query type '{}'. Allowed: {}", s, VALID_QUERY_TYPES.join(", ")))
+    }
+}
+
+/// Valid values for the --show-only flag
+const VALID_SHOW_FILTERS: &[&str] = &["SUCCESS", "NXDOMAIN", "NODATA", "TEMP"];
+
+/// Parse and validate the --show-only argument (case-insensitive)
+fn parse_show_filter(s: &str) -> Result<String, String> {
+    let upper = s.to_uppercase();
+    if VALID_SHOW_FILTERS.contains(&upper.as_str()) {
+        Ok(upper)
+    } else {
+        Err(format!("Invalid filter '{}'. Allowed: {}", s, VALID_SHOW_FILTERS.join(", ")))
+    }
+}
+
+/// Classify a LookupResult status string into a filter category
+fn classify_status(status: &str) -> &'static str {
+    match status {
+        "SUCCESS" => "SUCCESS",
+        "NXDOMAIN" => "NXDOMAIN",
+        "NODATA" => "NODATA",
+        "No records found" | "No A records found" | "No AAAA records found" => "NODATA",
+        // Everything else is a temporary/transient error
+        _ => "TEMP",
     }
 }
 
@@ -370,7 +400,15 @@ struct LookupResult {
 }
 
 impl LookupResult {
-    fn print(&self, json_output: bool, short: bool) {
+    fn print(&self, json_output: bool, short: bool, show_only: &[String]) {
+        // Apply --show-only filter: if filters are set, skip non-matching results
+        if !show_only.is_empty() {
+            let category = classify_status(&self.status);
+            if !show_only.iter().any(|f| f == category) {
+                return;
+            }
+        }
+
         if short {
             // --short: only print values for successful lookups, one per line
             if !self.is_success {
@@ -623,6 +661,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effective_types = Arc::new(effective_types);
     let json_mode = args.json;
     let short_mode = args.short;
+    let show_only: Arc<Vec<String>> = Arc::new(args.show_only.clone());
     let include_ttl = args.ttl && args.json; // TTL only meaningful with --json
 
     // Expand each input into one work item per query type (or one reverse item).
@@ -683,11 +722,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .buffer_unordered(args.concurrency)
             .for_each(|result| {
                 let pb = pb_output.clone();
+                let show_only = show_only.clone();
                 async move {
                     if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(json_mode, short_mode));
+                        pb.suspend(|| result.print(json_mode, short_mode, &show_only));
                     } else {
-                        result.print(json_mode, short_mode);
+                        result.print(json_mode, short_mode, &show_only);
                     }
                 }
             })
@@ -697,11 +737,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .buffered(args.concurrency)
             .for_each(|result| {
                 let pb = pb_output.clone();
+                let show_only = show_only.clone();
                 async move {
                     if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(json_mode, short_mode));
+                        pb.suspend(|| result.print(json_mode, short_mode, &show_only));
                     } else {
-                        result.print(json_mode, short_mode);
+                        result.print(json_mode, short_mode, &show_only);
                     }
                 }
             })
