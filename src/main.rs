@@ -558,11 +558,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } // EOF
 
                 stats_stream.bytes_read.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                if let Some(ref pb) = pb_stream {
-                    if is_regular_file {
+                if let Some(ref pb) = pb_stream
+                    && is_regular_file {
                         pb.set_position(stats_stream.bytes_read.load(Ordering::Relaxed));
                     }
-                }
 
                 if let Some(i) = &mut interval {
                     i.tick().await;
