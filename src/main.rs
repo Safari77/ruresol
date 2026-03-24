@@ -297,6 +297,39 @@ impl QueryStats {
             rtt_str
         )
     }
+
+    /// Format statistics as a JSON object for --stats --json
+    fn format_summary_json(&self) -> String {
+        let completed = self.completed.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let succeeded = completed - errors;
+        let elapsed = self.start.elapsed().as_secs_f64();
+
+        let (rtt_min, rtt_avg, rtt_max, rtt_mdev) = if let Ok(rtt) = self.rtt.lock() {
+            if rtt.count > 0 {
+                (rtt.min_ms, rtt.avg_ms(), rtt.max_ms, rtt.mdev_ms())
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            }
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
+        serde_json::json!({
+            "stats": {
+                "queries": completed,
+                "succeeded": succeeded,
+                "errors": errors,
+                "elapsed_sec": (elapsed * 1000.0).round() / 1000.0,
+                "qps": (self.qps() * 10.0).round() / 10.0,
+                "rtt_ms_min": (rtt_min * 1000.0).round() / 1000.0,
+                "rtt_ms_avg": (rtt_avg * 1000.0).round() / 1000.0,
+                "rtt_ms_max": (rtt_max * 1000.0).round() / 1000.0,
+                "rtt_ms_mdev": (rtt_mdev * 1000.0).round() / 1000.0
+            }
+        })
+        .to_string()
+    }
 }
 
 // ─── Record / Result types ──────────────────────────────────────────────────
@@ -683,7 +716,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print statistics summary (--stats)
     if args.stats {
-        eprintln!("{}", stats.format_summary());
+        if args.json {
+            println!("{}", stats.format_summary_json());
+        } else {
+            eprintln!("{}", stats.format_summary());
+        }
     }
 
     Ok(())
