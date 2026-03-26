@@ -464,6 +464,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply custom timeouts and retries
     opts.timeout = Duration::from_millis(args.timeout);
     opts.attempts = args.attempts;
+    // edns_payload_len is 4096 in 0.25.2 and 1232 in next 0.26 release
+    opts.edns0 = true;
+    opts.try_tcp_on_error = true;
 
     let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
         .with_options(opts)
@@ -679,20 +682,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Classify a resolve error into an output message suffix.
-/// Returns the appropriate error string for the given ResolveError.
-fn classify_resolve_error(e: &hickory_resolver::ResolveError) -> &'static str {
+/// Returns a descriptive error string for the given ResolveError.
+fn classify_resolve_error(e: &hickory_resolver::ResolveError) -> String {
     match e.kind() {
         ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
             ProtoErrorKind::NoRecordsFound { response_code, .. } => match *response_code {
-                ResponseCode::NXDomain => "NXDOMAIN",
-                ResponseCode::ServFail => "Temporary error",
-                ResponseCode::NoError => "NODATA",
-                _ => "No records found",
+                ResponseCode::NXDomain => "NXDOMAIN".to_string(),
+                ResponseCode::NoError => "NODATA".to_string(),
+                ResponseCode::ServFail => "SERVFAIL".to_string(),
+                ResponseCode::Refused => "REFUSED".to_string(),
+                other => format!("NO_RECORDS ({other})"),
             },
-            ProtoErrorKind::Timeout => "Temporary error",
-            _ => "Temporary error",
+            ProtoErrorKind::Timeout => "TIMEOUT".to_string(),
+            // This will catch message parsing errors, truncation issues, etc.
+            _ => format!("PROTO_ERR: {}", proto_err),
         },
-        _ => "Temporary error",
+        // Fallback: print the actual error message so you know exactly what failed
+        _ => format!("ERR: {}", e),
+    }
+}
+
+/// Helper: build an error LookupResult
+fn lookup_error(
+    input: String,
+    qt_lower: String,
+    e: &hickory_resolver::ResolveError,
+) -> LookupResult {
+    LookupResult {
+        query: input,
+        query_type: qt_lower,
+        is_success: false,
+        status: classify_resolve_error(e), // Now consumes the generated String
+        records: vec![],
+        ttl: None,
     }
 }
 
@@ -733,22 +755,6 @@ fn lookup_success(
         },
         records,
         ttl,
-    }
-}
-
-/// Helper: build an error LookupResult
-fn lookup_error(
-    input: String,
-    qt_lower: String,
-    e: &hickory_resolver::ResolveError,
-) -> LookupResult {
-    LookupResult {
-        query: input,
-        query_type: qt_lower,
-        is_success: false,
-        status: classify_resolve_error(e).to_string(),
-        records: vec![],
-        ttl: None,
     }
 }
 
