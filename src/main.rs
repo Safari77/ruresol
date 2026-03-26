@@ -9,6 +9,7 @@ use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::ProtoErrorKind;
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::proto::rr::rdata::{A, AAAA};
 use hickory_resolver::proto::xfer::Protocol;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
@@ -22,8 +23,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// Valid values for the --type flag
-const VALID_QUERY_TYPES: &[&str] =
-    &["A", "AAAA", "MX", "NS", "CAA", "DNSKEY", "DS", "HTTPS", "PTR", "SOA", "SRV", "TLSA", "TXT"];
+const VALID_QUERY_TYPES: &[&str] = &[
+    "A", "AAAA", "MX", "NS", "CAA", "DNSKEY", "DS", "HTTPS", "PTR", "PTRMATCH", "SOA", "SRV",
+    "TLSA", "TXT",
+];
 
 /// A bulk DNS lookup tool.
 /// Reads items from stdin and resolves them concurrently.
@@ -72,7 +75,7 @@ struct Args {
     #[arg(long)]
     no_stdin: bool,
 
-    /// DNS query type. Can be specified multiple times. Allowed: A, AAAA, MX, NS, CAA, DNSKEY, DS, HTTPS, PTR, SOA, SRV, TLSA, TXT
+    /// DNS query type. Can be specified multiple times. Allowed: A, AAAA, MX, NS, CAA, DNSKEY, DS, HTTPS, PTR, PTRMATCH, SOA, SRV, TLSA, TXT
     #[arg(long = "type", value_parser = parse_query_type, required = true)]
     query_type: Vec<String>,
 
@@ -97,7 +100,7 @@ struct Args {
     ttl: bool,
 
     /// Only show results matching these statuses. Can be specified multiple times.
-    /// Allowed: SUCCESS, NXDOMAIN, NODATA, TEMP
+    /// Allowed: SUCCESS, PTRMATCH, NXDOMAIN, NODATA, TEMP
     #[arg(long = "show-only", value_parser = parse_show_filter)]
     show_only: Vec<String>,
 }
@@ -113,7 +116,7 @@ fn parse_query_type(s: &str) -> Result<String, String> {
 }
 
 /// Valid values for the --show-only flag
-const VALID_SHOW_FILTERS: &[&str] = &["SUCCESS", "NXDOMAIN", "NODATA", "TEMP"];
+const VALID_SHOW_FILTERS: &[&str] = &["SUCCESS", "PTRMATCH", "NXDOMAIN", "NODATA", "TEMP"];
 
 /// Parse and validate the --show-only argument (case-insensitive)
 fn parse_show_filter(s: &str) -> Result<String, String> {
@@ -129,6 +132,7 @@ fn parse_show_filter(s: &str) -> Result<String, String> {
 fn classify_status(status: &str) -> &'static str {
     match status {
         "SUCCESS" => "SUCCESS",
+        "PTRMATCH" => "PTRMATCH",
         "NXDOMAIN" => "NXDOMAIN",
         "NODATA" => "NODATA",
         "No records found" => "NODATA",
@@ -859,6 +863,73 @@ async fn typed_lookup(
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
+        // PTRMATCH: PTR lookup + forward-confirm A/AAAA against the original IP.
+        // If the forward lookup matches, output label is "PTRMATCH"; otherwise "PTR".
+        // If input is not an IP address, falls through to regular PTR behavior.
+        "PTRMATCH" => {
+            if let Ok(ip) = input.parse::<IpAddr>() {
+                match resolver.reverse_lookup(ip).await {
+                    Ok(lookup) => {
+                        let records: Vec<RecordEntry> = lookup
+                            .iter()
+                            .map(|name| RecordEntry::Simple(name.to_string()))
+                            .collect();
+
+                        // Forward-confirm: resolve A (IPv4) or AAAA (IPv6) for each PTR name
+                        let mut any_match = false;
+                        'fwd: for record in &records {
+                            let ptr_name = match record {
+                                RecordEntry::Simple(s) => s.as_str(),
+                                _ => continue,
+                            };
+                            match ip {
+                                IpAddr::V4(v4) => {
+                                    if let Ok(fwd) = resolver.ipv4_lookup(ptr_name).await {
+                                        if fwd.iter().any(|a| *a == A(v4)) {
+                                            any_match = true;
+                                            break 'fwd;
+                                        }
+                                    }
+                                }
+                                IpAddr::V6(v6) => {
+                                    if let Ok(fwd) = resolver.ipv6_lookup(ptr_name).await {
+                                        if fwd.iter().any(|a| *a == AAAA(v6)) {
+                                            any_match = true;
+                                            break 'fwd;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let label = if any_match { "ptrmatch" } else { "ptr" };
+                        let mut result = lookup_success(input, label.to_string(), records, None);
+                        if any_match && result.is_success {
+                            result.status = "PTRMATCH".to_string();
+                        }
+                        result
+                    }
+                    Err(e) => lookup_error(input, "ptr".to_string(), &e),
+                }
+            } else {
+                // Not an IP — do a generic PTR lookup (no forward-confirm possible)
+                match resolver.lookup(input.as_str(), RecordType::PTR).await {
+                    Ok(lookup) => {
+                        let ttl = if include_ttl {
+                            lookup.record_iter().map(|r| r.ttl()).min()
+                        } else {
+                            None
+                        };
+                        let records: Vec<RecordEntry> = lookup
+                            .record_iter()
+                            .map(|r| RecordEntry::Simple(r.data().to_string()))
+                            .collect();
+                        lookup_success(input, "ptr".to_string(), records, ttl)
+                    }
+                    Err(e) => lookup_error(input, "ptr".to_string(), &e),
+                }
+            }
+        }
         // PTR: if input is an IP address, use reverse_lookup; otherwise generic lookup
         "PTR" => {
             if let Ok(ip) = input.parse::<IpAddr>() {
