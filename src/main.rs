@@ -83,6 +83,10 @@ struct Args {
     #[arg(last = true)]
     extra: Vec<String>,
 
+    /// Shuffle (Knuth/Fisher-Yates) the domains specified after -- before resolving
+    #[arg(long)]
+    shuf: bool,
+
     /// Show progress bar and live query statistics on stderr
     #[arg(long)]
     progress: bool,
@@ -521,8 +525,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.rate_limit.map(|qps| tokio::time::interval(Duration::from_micros(1_000_000 / qps)));
 
     // Collect extra domains passed after --
-    let extra_domains: Vec<String> =
+    let mut extra_domains: Vec<String> =
         args.extra.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+    // Knuth (Fisher-Yates) shuffle of -- arguments when --shuf is set
+    if args.shuf && extra_domains.len() > 1 {
+        use rand::seq::SliceRandom;
+        extra_domains.shuffle(&mut rand::rng());
+    }
 
     // Initialize statistics tracking (used by --progress and --stats)
     let stats = Arc::new(QueryStats::new(is_regular_file));
