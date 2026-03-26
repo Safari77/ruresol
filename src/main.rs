@@ -445,6 +445,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Deduplicate query types while preserving order
     let effective_types = dedup_types(&args.query_type);
 
+    // --type ptrmatch is exclusive: cannot be combined with other types
+    let has_ptrmatch = effective_types.iter().any(|t| t == "PTRMATCH");
+    if has_ptrmatch && effective_types.len() > 1 {
+        eprintln!("error: --type ptrmatch cannot be combined with other query types");
+        std::process::exit(1);
+    }
+
+    // --show-only ptrmatch requires --type ptrmatch
+    if args.show_only.iter().any(|f| f == "PTRMATCH") && !has_ptrmatch {
+        eprintln!("error: --show-only ptrmatch requires --type ptrmatch");
+        std::process::exit(1);
+    }
+
     // Initialize Resolver Config (Custom vs System Default)
     let (config, mut opts) = if args.doh {
         (ResolverConfig::cloudflare_https(), ResolverOpts::default())
@@ -904,7 +917,7 @@ async fn typed_lookup(
 
                         let label = if any_match { "ptrmatch" } else { "ptr" };
                         let mut result = lookup_success(input, label.to_string(), records, None);
-                        if any_match && result.is_success {
+                        if any_match {
                             result.status = "PTRMATCH".to_string();
                         }
                         result
