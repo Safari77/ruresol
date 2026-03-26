@@ -76,7 +76,7 @@ struct Args {
     no_stdin: bool,
 
     /// DNS query type. Can be specified multiple times. Allowed: A, AAAA, MX, NS, CAA, DNSKEY, DS, HTTPS, PTR, PTRMATCH, SOA, SRV, TLSA, TXT
-    #[arg(long = "type", value_parser = parse_query_type, required = true)]
+    #[arg(long = "type", value_parser = parse_query_type, required = true, value_delimiter = ',')]
     query_type: Vec<String>,
 
     /// Extra domains to resolve (specified after --)
@@ -101,7 +101,7 @@ struct Args {
 
     /// Only show results matching these statuses. Can be specified multiple times.
     /// Allowed: SUCCESS, PTRMATCH, NXDOMAIN, NODATA, TEMP
-    #[arg(long = "show-only", value_parser = parse_show_filter)]
+    #[arg(long = "show-only", value_parser = parse_show_filter, value_delimiter = ',')]
     show_only: Vec<String>,
 }
 
