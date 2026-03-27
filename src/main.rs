@@ -932,20 +932,18 @@ async fn typed_lookup(
                             };
                             match ip {
                                 IpAddr::V4(v4) => {
-                                    if let Ok(fwd) = resolver.ipv4_lookup(ptr_name).await {
-                                        if fwd.iter().any(|a| *a == A(v4)) {
+                                    if let Ok(fwd) = resolver.ipv4_lookup(ptr_name).await
+                                        && fwd.iter().any(|a| *a == A(v4)) {
                                             any_match = true;
                                             break 'fwd;
                                         }
-                                    }
                                 }
                                 IpAddr::V6(v6) => {
-                                    if let Ok(fwd) = resolver.ipv6_lookup(ptr_name).await {
-                                        if fwd.iter().any(|a| *a == AAAA(v6)) {
+                                    if let Ok(fwd) = resolver.ipv6_lookup(ptr_name).await
+                                        && fwd.iter().any(|a| *a == AAAA(v6)) {
                                             any_match = true;
                                             break 'fwd;
                                         }
-                                    }
                                 }
                             }
                         }
