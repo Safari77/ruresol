@@ -391,6 +391,8 @@ struct LookupResult {
 
 impl LookupResult {
     fn print(&self, json_output: bool, short: bool, show_only: &[String]) {
+        use std::io::Write;
+
         // Apply --show-only filter: if filters are set, skip non-matching results
         if !show_only.is_empty() {
             let category = classify_status(&self.status);
@@ -399,43 +401,60 @@ impl LookupResult {
             }
         }
 
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+
         if short {
             // --short: only print values for successful lookups, one per line
             if !self.is_success {
                 return;
             }
             for record in &self.records {
-                match record {
+                let res = match record {
                     RecordEntry::WithPriority { priority, value } => {
-                        println!("{} {}", priority, value);
+                        writeln!(out, "{} {}", priority, value)
                     }
                     RecordEntry::Simple(value) => {
-                        println!("{}", value);
+                        writeln!(out, "{}", value)
                     }
+                };
+                if res.is_err() {
+                    std::process::exit(0);
                 }
             }
             return;
         }
 
-        if json_output {
+        let res = if json_output {
             if let Ok(json_str) = serde_json::to_string(self) {
-                println!("{}", json_str);
+                writeln!(out, "{}", json_str)
+            } else {
+                return;
             }
         } else if self.is_success {
             // One record per line: "query TYPE [priority]=value"
             let qt = &self.query_type.to_uppercase();
+            let mut res = Ok(());
             for record in &self.records {
-                match record {
+                res = match record {
                     RecordEntry::WithPriority { priority, value } => {
-                        println!("{} {} {}={}", self.query, qt, priority, value);
+                        writeln!(out, "{} {} {}={}", self.query, qt, priority, value)
                     }
                     RecordEntry::Simple(value) => {
-                        println!("{} {}={}", self.query, qt, value);
+                        writeln!(out, "{} {}={}", self.query, qt, value)
                     }
+                };
+                if res.is_err() {
+                    break;
                 }
             }
+            res
         } else {
-            println!("{}:{}", self.query, self.status);
+            writeln!(out, "{}:{}", self.query, self.status)
+        };
+
+        if res.is_err() {
+            std::process::exit(0);
         }
     }
 }
@@ -444,6 +463,11 @@ impl LookupResult {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args = Args::parse();
 
     // Deduplicate query types while preserving order
@@ -699,7 +723,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print statistics summary (--stats)
     if args.stats {
         if args.json {
-            println!("{}", stats.format_summary_json());
+            use std::io::Write;
+            let _ = writeln!(std::io::stdout().lock(), "{}", stats.format_summary_json());
         } else {
             eprintln!("{}", stats.format_summary());
         }
