@@ -34,4 +34,4 @@ while read -r key rest; do
     if [[ "$key" == "-s" ]]; then
         echo "$REVIP4"."${rest}"
     fi
-done < "$RBLRC" | ruresol -a
+done < "$RBLRC" | ruresol --type a
