@@ -1,16 +1,13 @@
 use clap::Parser;
 use futures::stream::StreamExt;
-use hickory_resolver::ResolveErrorKind;
-use hickory_resolver::Resolver;
+use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
-    NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts,
+    CLOUDFLARE, ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts,
 };
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::ProtoErrorKind;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::proto::rr::rdata::{A, AAAA};
-use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::proto::rr::{RData, RecordType};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -18,9 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-
-// TokioResolver type alias for convenience
-type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// Valid values for the --type flag
 const VALID_QUERY_TYPES: &[&str] = &[
@@ -488,20 +482,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Resolver Config (Custom vs System Default)
     let (config, mut opts) = if args.doh {
-        (ResolverConfig::cloudflare_https(), ResolverOpts::default())
+        (ResolverConfig::https(&CLOUDFLARE), ResolverOpts::default())
     } else if !args.resolver.is_empty() {
-        let mut nsg = NameServerConfigGroup::new();
+        let mut cfg = ResolverConfig::from_parts(None, vec![], vec![]);
         for r in &args.resolver {
-            let addr: SocketAddr = if let Ok(ip) = r.parse::<IpAddr>() {
-                SocketAddr::new(ip, 53)
+            // Accept either "IP" (port 53) or "IP:PORT"
+            let (ip, port): (IpAddr, u16) = if let Ok(ip) = r.parse::<IpAddr>() {
+                (ip, 53)
             } else {
-                r.parse()
-                    .unwrap_or_else(|_| panic!("Invalid resolver format: {}. Use IP or IP:PORT", r))
+                let sa: SocketAddr = r.parse().unwrap_or_else(|_| {
+                    panic!("Invalid resolver format: {}. Use IP or IP:PORT", r)
+                });
+                (sa.ip(), sa.port())
             };
-            nsg.push(NameServerConfig::new(addr, Protocol::Udp));
-            nsg.push(NameServerConfig::new(addr, Protocol::Tcp));
+            // Build UDP + TCP connections with the (possibly non-default) port
+            let mut udp = ConnectionConfig::new(ProtocolConfig::Udp);
+            udp.port = port;
+            let mut tcp = ConnectionConfig::new(ProtocolConfig::Tcp);
+            tcp.port = port;
+            cfg.add_name_server(NameServerConfig::new(ip, true, vec![udp, tcp]));
         }
-        (ResolverConfig::from_parts(None, vec![], nsg), ResolverOpts::default())
+        (cfg, ResolverOpts::default())
     } else {
         hickory_resolver::system_conf::read_system_conf()?
     };
@@ -513,9 +514,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.edns0 = true;
     opts.try_tcp_on_error = true;
 
-    let resolver = Resolver::builder_with_config(config, TokioConnectionProvider::default())
+    let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
-        .build();
+        .build()?;
 
     // Determine file size for progress bar (if -i points to a regular file)
     let (file_size, is_regular_file) = if let Some(path) = &args.input {
@@ -734,32 +735,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Classify a resolve error into an output message suffix.
-/// Returns a descriptive error string for the given ResolveError.
-fn classify_resolve_error(e: &hickory_resolver::ResolveError) -> String {
-    match e.kind() {
-        ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
-            ProtoErrorKind::NoRecordsFound { response_code, .. } => match *response_code {
-                ResponseCode::NXDomain => "NXDOMAIN".to_string(),
-                ResponseCode::NoError => "NODATA".to_string(),
-                ResponseCode::ServFail => "SERVFAIL".to_string(),
-                ResponseCode::Refused => "REFUSED".to_string(),
-                other => format!("NO_RECORDS ({other})"),
-            },
-            ProtoErrorKind::Timeout => "TIMEOUT".to_string(),
-            // This will catch message parsing errors, truncation issues, etc.
-            _ => format!("PROTO_ERR: {}", proto_err),
+/// Returns a descriptive error string for the given NetError.
+fn classify_resolve_error(e: &NetError) -> String {
+    match e {
+        NetError::Timeout => "TIMEOUT".to_string(),
+        NetError::Dns(DnsError::NoRecordsFound(no_records)) => match no_records.response_code {
+            ResponseCode::NXDomain => "NXDOMAIN".to_string(),
+            ResponseCode::NoError => "NODATA".to_string(),
+            ResponseCode::ServFail => "SERVFAIL".to_string(),
+            ResponseCode::Refused => "REFUSED".to_string(),
+            other => format!("NO_RECORDS ({other})"),
         },
+        NetError::Dns(DnsError::ResponseCode(rc)) => match *rc {
+            ResponseCode::NXDomain => "NXDOMAIN".to_string(),
+            ResponseCode::NoError => "NODATA".to_string(),
+            ResponseCode::ServFail => "SERVFAIL".to_string(),
+            ResponseCode::Refused => "REFUSED".to_string(),
+            other => format!("RCODE ({other})"),
+        },
+        NetError::Proto(proto_err) => format!("PROTO_ERR: {}", proto_err),
         // Fallback: print the actual error message so you know exactly what failed
         _ => format!("ERR: {}", e),
     }
 }
 
 /// Helper: build an error LookupResult
-fn lookup_error(
-    input: String,
-    qt_lower: String,
-    e: &hickory_resolver::ResolveError,
-) -> LookupResult {
+fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
     LookupResult {
         query: input,
         query_type: qt_lower,
@@ -786,7 +787,7 @@ async fn fetch_ttl(
         .lookup(name, record_type)
         .await
         .ok()
-        .and_then(|l| l.record_iter().map(|r| r.ttl()).min())
+        .and_then(|l| l.answers().iter().map(|r| r.ttl).min())
 }
 
 /// Helper: build a successful LookupResult
@@ -823,8 +824,14 @@ async fn typed_lookup(
         "A" => match resolver.ipv4_lookup(input.as_str()).await {
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::A, include_ttl).await;
-                let records: Vec<RecordEntry> =
-                    lookup.iter().map(|ip| RecordEntry::Simple(ip.to_string())).collect();
+                let records: Vec<RecordEntry> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::A(a) => Some(RecordEntry::Simple(a.0.to_string())),
+                        _ => None,
+                    })
+                    .collect();
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
@@ -832,8 +839,14 @@ async fn typed_lookup(
         "AAAA" => match resolver.ipv6_lookup(input.as_str()).await {
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::AAAA, include_ttl).await;
-                let records: Vec<RecordEntry> =
-                    lookup.iter().map(|ip| RecordEntry::Simple(ip.to_string())).collect();
+                let records: Vec<RecordEntry> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::AAAA(a) => Some(RecordEntry::Simple(a.0.to_string())),
+                        _ => None,
+                    })
+                    .collect();
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
@@ -842,10 +855,14 @@ async fn typed_lookup(
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::MX, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
+                    .answers()
                     .iter()
-                    .map(|mx| RecordEntry::WithPriority {
-                        priority: mx.preference(),
-                        value: mx.exchange().to_string(),
+                    .filter_map(|r| match &r.data {
+                        RData::MX(mx) => Some(RecordEntry::WithPriority {
+                            priority: mx.preference,
+                            value: mx.exchange.to_string(),
+                        }),
+                        _ => None,
                     })
                     .collect();
                 lookup_success(input, qt_lower, records, ttl)
@@ -855,8 +872,14 @@ async fn typed_lookup(
         "NS" => match resolver.ns_lookup(input.as_str()).await {
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::NS, include_ttl).await;
-                let records: Vec<RecordEntry> =
-                    lookup.iter().map(|ns| RecordEntry::Simple(ns.0.to_string())).collect();
+                let records: Vec<RecordEntry> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::NS(ns) => Some(RecordEntry::Simple(ns.0.to_string())),
+                        _ => None,
+                    })
+                    .collect();
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
@@ -864,8 +887,14 @@ async fn typed_lookup(
         "TXT" => match resolver.txt_lookup(input.as_str()).await {
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::TXT, include_ttl).await;
-                let records: Vec<RecordEntry> =
-                    lookup.iter().map(|txt| RecordEntry::Simple(txt.to_string())).collect();
+                let records: Vec<RecordEntry> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::TXT(txt) => Some(RecordEntry::Simple(txt.to_string())),
+                        _ => None,
+                    })
+                    .collect();
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
@@ -874,18 +903,20 @@ async fn typed_lookup(
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SOA, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
+                    .answers()
                     .iter()
-                    .map(|soa| {
-                        RecordEntry::Simple(format!(
+                    .filter_map(|r| match &r.data {
+                        RData::SOA(soa) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {} {} {} {}",
-                            soa.mname(),
-                            soa.rname(),
-                            soa.serial(),
-                            soa.refresh(),
-                            soa.retry(),
-                            soa.expire(),
-                            soa.minimum()
-                        ))
+                            soa.mname,
+                            soa.rname,
+                            soa.serial,
+                            soa.refresh,
+                            soa.retry,
+                            soa.expire,
+                            soa.minimum
+                        ))),
+                        _ => None,
                     })
                     .collect();
                 lookup_success(input, qt_lower, records, ttl)
@@ -896,15 +927,14 @@ async fn typed_lookup(
             Ok(lookup) => {
                 let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SRV, include_ttl).await;
                 let records: Vec<RecordEntry> = lookup
+                    .answers()
                     .iter()
-                    .map(|srv| {
-                        RecordEntry::Simple(format!(
+                    .filter_map(|r| match &r.data {
+                        RData::SRV(srv) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {}",
-                            srv.priority(),
-                            srv.weight(),
-                            srv.port(),
-                            srv.target()
-                        ))
+                            srv.priority, srv.weight, srv.port, srv.target
+                        ))),
+                        _ => None,
                     })
                     .collect();
                 lookup_success(input, qt_lower, records, ttl)
@@ -916,11 +946,17 @@ async fn typed_lookup(
         // If input is not an IP address, falls through to regular PTR behavior.
         "PTRMATCH" => {
             if let Ok(ip) = input.parse::<IpAddr>() {
-                match resolver.reverse_lookup(ip).await {
+                // reverse_lookup takes impl IntoName; convert IP → reverse DNS Name
+                let rev_name = hickory_resolver::proto::rr::Name::from(ip);
+                match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
                         let records: Vec<RecordEntry> = lookup
+                            .answers()
                             .iter()
-                            .map(|name| RecordEntry::Simple(name.to_string()))
+                            .filter_map(|r| match &r.data {
+                                RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
+                                _ => None,
+                            })
                             .collect();
 
                         // Forward-confirm: resolve A (IPv4) or AAAA (IPv6) for each PTR name
@@ -932,18 +968,27 @@ async fn typed_lookup(
                             };
                             match ip {
                                 IpAddr::V4(v4) => {
-                                    if let Ok(fwd) = resolver.ipv4_lookup(ptr_name).await
-                                        && fwd.iter().any(|a| *a == A(v4)) {
+                                    if let Ok(fwd) = resolver.ipv4_lookup(ptr_name).await {
+                                        let has_match = fwd
+                                            .answers()
+                                            .iter()
+                                            .any(|r| matches!(&r.data, RData::A(a) if a.0 == v4));
+                                        if has_match {
                                             any_match = true;
                                             break 'fwd;
                                         }
+                                    }
                                 }
                                 IpAddr::V6(v6) => {
-                                    if let Ok(fwd) = resolver.ipv6_lookup(ptr_name).await
-                                        && fwd.iter().any(|a| *a == AAAA(v6)) {
+                                    if let Ok(fwd) = resolver.ipv6_lookup(ptr_name).await {
+                                        let has_match = fwd.answers().iter().any(
+                                            |r| matches!(&r.data, RData::AAAA(a) if a.0 == v6),
+                                        );
+                                        if has_match {
                                             any_match = true;
                                             break 'fwd;
                                         }
+                                    }
                                 }
                             }
                         }
@@ -962,13 +1007,14 @@ async fn typed_lookup(
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
                         let ttl = if include_ttl {
-                            lookup.record_iter().map(|r| r.ttl()).min()
+                            lookup.answers().iter().map(|r| r.ttl).min()
                         } else {
                             None
                         };
                         let records: Vec<RecordEntry> = lookup
-                            .record_iter()
-                            .map(|r| RecordEntry::Simple(r.data().to_string()))
+                            .answers()
+                            .iter()
+                            .map(|r| RecordEntry::Simple(r.data.to_string()))
                             .collect();
                         lookup_success(input, "ptr".to_string(), records, ttl)
                     }
@@ -979,11 +1025,16 @@ async fn typed_lookup(
         // PTR: if input is an IP address, use reverse_lookup; otherwise generic lookup
         "PTR" => {
             if let Ok(ip) = input.parse::<IpAddr>() {
-                match resolver.reverse_lookup(ip).await {
+                let rev_name = hickory_resolver::proto::rr::Name::from(ip);
+                match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
                         let records: Vec<RecordEntry> = lookup
+                            .answers()
                             .iter()
-                            .map(|name| RecordEntry::Simple(name.to_string()))
+                            .filter_map(|r| match &r.data {
+                                RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
+                                _ => None,
+                            })
                             .collect();
                         lookup_success(input, qt_lower, records, None)
                     }
@@ -994,13 +1045,14 @@ async fn typed_lookup(
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
                         let ttl = if include_ttl {
-                            lookup.record_iter().map(|r| r.ttl()).min()
+                            lookup.answers().iter().map(|r| r.ttl).min()
                         } else {
                             None
                         };
                         let records: Vec<RecordEntry> = lookup
-                            .record_iter()
-                            .map(|r| RecordEntry::Simple(r.data().to_string()))
+                            .answers()
+                            .iter()
+                            .map(|r| RecordEntry::Simple(r.data.to_string()))
                             .collect();
                         lookup_success(input, qt_lower, records, ttl)
                     }
@@ -1015,13 +1067,14 @@ async fn typed_lookup(
             match resolver.lookup(input.as_str(), record_type).await {
                 Ok(lookup) => {
                     let ttl = if include_ttl {
-                        lookup.record_iter().map(|r| r.ttl()).min()
+                        lookup.answers().iter().map(|r| r.ttl).min()
                     } else {
                         None
                     };
                     let records: Vec<RecordEntry> = lookup
-                        .record_iter()
-                        .map(|r| RecordEntry::Simple(r.data().to_string()))
+                        .answers()
+                        .iter()
+                        .map(|r| RecordEntry::Simple(r.data.to_string()))
                         .collect();
                     lookup_success(input, qt_lower, records, ttl)
                 }
