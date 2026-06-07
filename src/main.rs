@@ -7,12 +7,13 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::{RData, RecordType};
+use hickory_resolver::proto::rr::{Name, RData, RecordType};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashSet;
+use ipnet::IpNet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
@@ -93,7 +94,7 @@ struct Args {
     #[arg(long)]
     stats: bool,
 
-    /// Include TTL in JSON output (only effective with --json)
+    /// Include TTL in JSON output (effective with --json or --json-array)
     #[arg(long)]
     ttl: bool,
 
@@ -101,6 +102,36 @@ struct Args {
     /// Allowed: SUCCESS, PTRMATCH, NXDOMAIN, NODATA, TEMP
     #[arg(long = "show-only", value_parser = parse_show_filter, value_delimiter = ',')]
     show_only: Vec<String>,
+
+    /// In plain output, print the punycode (IDNA/ASCII) form of each query name
+    /// instead of the name as typed. JSON output always preserves the original
+    /// "query" and adds a "punycode" field for names with non-ASCII labels,
+    /// regardless of this flag.
+    #[arg(long)]
+    punycode: bool,
+
+    /// Output a single JSON array document for the whole run, instead of the
+    /// line-delimited objects produced by --json. With --stats the array is wrapped
+    /// as {"results": [...], "stats": {...}}.
+    #[arg(long)]
+    json_array: bool,
+
+    /// Only show IP-valued records contained in this CIDR (e.g. 10.0.0.0/8 or
+    /// 2001:db8::/32). Can be specified multiple times. Records outside every given
+    /// CIDR (and non-IP records) are suppressed.
+    #[arg(long = "match-cidr", value_parser = parse_cidr)]
+    match_cidr: Vec<IpNet>,
+
+    /// Drop records that are private or reserved IP addresses (IPv4 and IPv6:
+    /// RFC1918, loopback, link-local, CGNAT, ULA, documentation, multicast, etc.).
+    #[arg(long)]
+    exclude_private: bool,
+
+    /// Detect DNS wildcards for the parent domains listed in FILE (one per line,
+    /// '#' comments allowed) and filter out A/AAAA answers whose address set is a
+    /// subset of a parent's learned wildcard address set.
+    #[arg(long = "wildcard-filter", value_name = "FILE")]
+    wildcard_filter: Option<String>,
 }
 
 /// Parse and validate the --type argument (case-insensitive)
@@ -124,6 +155,11 @@ fn parse_show_filter(s: &str) -> Result<String, String> {
     } else {
         Err(format!("Invalid filter '{}'. Allowed: {}", s, VALID_SHOW_FILTERS.join(", ")))
     }
+}
+
+/// Parse and validate a CIDR for --match-cidr (e.g. "10.0.0.0/8" or "2001:db8::/32")
+fn parse_cidr(s: &str) -> Result<IpNet, String> {
+    s.parse::<IpNet>().map_err(|e| format!("invalid CIDR '{}': {}", s, e))
 }
 
 /// Classify a LookupResult status string into a filter category
@@ -171,6 +207,155 @@ fn dedup_types(types: &[String]) -> Vec<String> {
     result
 }
 
+// ─── IDN / punycode, percentile, IP and wildcard helpers ────────────────────
+
+/// Convert a name to its punycode (IDNA / ASCII) form using the resolver's own
+/// name encoding, so the displayed value matches what is actually queried.
+/// ASCII inputs are returned unchanged; on IDNA failure the original is returned.
+fn to_punycode(input: &str) -> String {
+    // punycode only affects non-ASCII labels; pure-ASCII names are returned verbatim
+    if input.is_ascii() {
+        return input.to_string();
+    }
+    match Name::from_utf8(input) {
+        Ok(name) => {
+            let mut ascii = name.to_ascii();
+            // Preserve the caller's trailing-dot convention
+            if !input.ends_with('.') {
+                while ascii.ends_with('.') {
+                    ascii.pop();
+                }
+            }
+            ascii
+        }
+        Err(_) => input.to_string(),
+    }
+}
+
+/// The punycode form, but only when it differs from the input (i.e. the name
+/// contains non-ASCII labels). ASCII / already-punycode names return None so the
+/// JSON "punycode" field is omitted when it would just duplicate "query".
+fn punycode_if_different(input: &str) -> Option<String> {
+    if input.is_ascii() {
+        return None;
+    }
+    let p = to_punycode(input);
+    if p == input { None } else { Some(p) }
+}
+
+/// Linear-interpolation percentile (R-7 / NumPy default) over a pre-sorted slice.
+/// `p` is in [0, 100]. Returns 0.0 for an empty slice.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        return sorted[lo];
+    }
+    let frac = rank - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+}
+
+/// Well-known private / reserved IPv4 and IPv6 ranges. Built once and reused.
+/// These are the data behind --exclude-private; ipnet does the actual matching.
+fn reserved_nets() -> &'static [IpNet] {
+    static NETS: OnceLock<Vec<IpNet>> = OnceLock::new();
+    NETS.get_or_init(|| {
+        const RAW: &[&str] = &[
+            // IPv4
+            "0.0.0.0/8",          // "this host" / unspecified
+            "10.0.0.0/8",         // RFC1918 private
+            "100.64.0.0/10",      // CGNAT (RFC6598)
+            "127.0.0.0/8",        // loopback
+            "169.254.0.0/16",     // link-local
+            "172.16.0.0/12",      // RFC1918 private
+            "192.0.0.0/24",       // IETF protocol assignments
+            "192.0.2.0/24",       // TEST-NET-1 (documentation)
+            "192.88.99.0/24",     // 6to4 relay anycast
+            "192.168.0.0/16",     // RFC1918 private
+            "198.18.0.0/15",      // benchmarking
+            "198.51.100.0/24",    // TEST-NET-2 (documentation)
+            "203.0.113.0/24",     // TEST-NET-3 (documentation)
+            "224.0.0.0/4",        // multicast
+            "240.0.0.0/4",        // reserved / future use
+            "255.255.255.255/32", // limited broadcast
+            // IPv6
+            "::/128",        // unspecified
+            "::1/128",       // loopback
+            "::ffff:0:0/96", // IPv4-mapped
+            "100::/64",      // discard-only
+            "2001:db8::/32", // documentation
+            "fc00::/7",      // unique local (ULA)
+            "fe80::/10",     // link-local
+            "ff00::/8",      // multicast
+        ];
+        RAW.iter().map(|s| s.parse::<IpNet>().expect("valid reserved CIDR")).collect()
+    })
+}
+
+/// True if the address falls in any private/reserved range (used by --exclude-private).
+fn is_reserved_ip(ip: IpAddr) -> bool {
+    reserved_nets().iter().any(|net| net.contains(&ip))
+}
+
+/// Generate a random 12-char DNS label, used to probe a zone for wildcard responses.
+fn random_label() -> String {
+    use rand::RngExt;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..12).map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char).collect()
+}
+
+/// Normalize a host/parent for wildcard matching: punycode, lowercase, no trailing dot.
+fn normalize_host(h: &str) -> String {
+    to_punycode(h.trim()).trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Find the longest parent domain in `wildcards` that `host` belongs to, if any.
+/// `host` is expected to already be normalized via `normalize_host`.
+fn find_wildcard_parent<'a>(
+    host: &str,
+    wildcards: &'a HashMap<String, HashSet<IpAddr>>,
+) -> Option<&'a HashSet<IpAddr>> {
+    let mut best: Option<(&str, &HashSet<IpAddr>)> = None;
+    for (parent, set) in wildcards {
+        // exact match or a strict subdomain (the leading dot avoids "notexample.com"
+        // matching parent "example.com")
+        let matches = host == parent || host.ends_with(&format!(".{}", parent));
+        if matches && best.is_none_or(|(bp, _)| parent.len() > bp.len()) {
+            best = Some((parent.as_str(), set));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// A result is a wildcard hit when it has at least one IP and *every* resolved IP
+/// is contained in the parent's learned wildcard set. A single off-set IP means a
+/// genuine record and is kept.
+fn is_wildcard_hit(record_ips: &[IpAddr], wildcard_set: &HashSet<IpAddr>) -> bool {
+    !record_ips.is_empty() && record_ips.iter().all(|ip| wildcard_set.contains(ip))
+}
+
+/// Map a status string to a stable bucket name for per-status statistics.
+fn stats_bucket(status: &str) -> &'static str {
+    match status {
+        "SUCCESS" => "success",
+        "PTRMATCH" => "ptrmatch",
+        "NXDOMAIN" => "nxdomain",
+        "NODATA" | "No records found" => "nodata",
+        "TIMEOUT" => "timeout",
+        "SERVFAIL" => "servfail",
+        "REFUSED" => "refused",
+        _ => "other",
+    }
+}
+
 // ─── RTT / Query Statistics ─────────────────────────────────────────────────
 
 /// Tracks per-query RTT for min/avg/max/mdev calculation
@@ -180,11 +365,20 @@ struct RttTracker {
     max_ms: f64,
     sum_ms: f64,
     sum_sq_ms: f64,
+    // Per-query samples, kept so we can compute exact percentiles at the end.
+    samples: Vec<f64>,
 }
 
 impl RttTracker {
     fn new() -> Self {
-        Self { count: 0, min_ms: f64::MAX, max_ms: 0.0, sum_ms: 0.0, sum_sq_ms: 0.0 }
+        Self {
+            count: 0,
+            min_ms: f64::MAX,
+            max_ms: 0.0,
+            sum_ms: 0.0,
+            sum_sq_ms: 0.0,
+            samples: Vec::new(),
+        }
     }
 
     fn record(&mut self, duration: Duration) {
@@ -198,6 +392,7 @@ impl RttTracker {
         }
         self.sum_ms += ms;
         self.sum_sq_ms += ms * ms;
+        self.samples.push(ms);
     }
 
     fn avg_ms(&self) -> f64 {
@@ -230,6 +425,16 @@ impl RttTracker {
             self.mdev_ms()
         )
     }
+
+    /// Exact (p50, p95, p99) latency percentiles in milliseconds.
+    fn percentiles(&self) -> (f64, f64, f64) {
+        if self.samples.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        (percentile(&sorted, 50.0), percentile(&sorted, 95.0), percentile(&sorted, 99.0))
+    }
 }
 
 /// Shared query statistics (thread-safe)
@@ -242,6 +447,15 @@ struct QueryStats {
     file_input: bool, // true if -i with a regular file (known size)
     start: Instant,
     rtt: Mutex<RttTracker>,
+    // Per-status bucket counters (see stats_bucket)
+    status_success: AtomicU64,
+    status_ptrmatch: AtomicU64,
+    status_nxdomain: AtomicU64,
+    status_nodata: AtomicU64,
+    status_timeout: AtomicU64,
+    status_servfail: AtomicU64,
+    status_refused: AtomicU64,
+    status_other: AtomicU64,
 }
 
 impl QueryStats {
@@ -255,17 +469,61 @@ impl QueryStats {
             file_input,
             start: Instant::now(),
             rtt: Mutex::new(RttTracker::new()),
+            status_success: AtomicU64::new(0),
+            status_ptrmatch: AtomicU64::new(0),
+            status_nxdomain: AtomicU64::new(0),
+            status_nodata: AtomicU64::new(0),
+            status_timeout: AtomicU64::new(0),
+            status_servfail: AtomicU64::new(0),
+            status_refused: AtomicU64::new(0),
+            status_other: AtomicU64::new(0),
         }
     }
 
-    fn record_completion(&self, is_success: bool, duration: Duration) {
+    fn record_completion(&self, is_success: bool, status: &str, duration: Duration) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         if !is_success {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
+        self.bump_status(stats_bucket(status));
         if let Ok(mut rtt) = self.rtt.lock() {
             rtt.record(duration);
         }
+    }
+
+    /// Increment the counter for a given status bucket name.
+    fn bump_status(&self, bucket: &str) {
+        let counter = match bucket {
+            "success" => &self.status_success,
+            "ptrmatch" => &self.status_ptrmatch,
+            "nxdomain" => &self.status_nxdomain,
+            "nodata" => &self.status_nodata,
+            "timeout" => &self.status_timeout,
+            "servfail" => &self.status_servfail,
+            "refused" => &self.status_refused,
+            _ => &self.status_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Ordered (name, count) pairs for non-zero status buckets.
+    fn status_counts(&self) -> Vec<(&'static str, u64)> {
+        [
+            ("success", &self.status_success),
+            ("ptrmatch", &self.status_ptrmatch),
+            ("nxdomain", &self.status_nxdomain),
+            ("nodata", &self.status_nodata),
+            ("timeout", &self.status_timeout),
+            ("servfail", &self.status_servfail),
+            ("refused", &self.status_refused),
+            ("other", &self.status_other),
+        ]
+        .into_iter()
+        .filter_map(|(k, a)| {
+            let v = a.load(Ordering::Relaxed);
+            if v > 0 { Some((k, v)) } else { None }
+        })
+        .collect()
     }
 
     fn qps(&self) -> f64 {
@@ -304,8 +562,19 @@ impl QueryStats {
         let succeeded = completed - errors;
         let elapsed = self.start.elapsed();
 
-        let rtt_str =
-            if let Ok(rtt) = self.rtt.lock() { rtt.format_rtt() } else { "-/-/-/- ms".to_string() };
+        // Compute the RTT string and percentiles under a single lock
+        let (rtt_str, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock() {
+            let (p50, p95, p99) = rtt.percentiles();
+            (rtt.format_rtt(), p50, p95, p99)
+        } else {
+            ("-/-/-/- ms".to_string(), 0.0, 0.0, 0.0)
+        };
+
+        let status_str = {
+            let parts: Vec<String> =
+                self.status_counts().into_iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            if parts.is_empty() { "-".to_string() } else { parts.join(" ") }
+        };
 
         format!(
             "\n--- Query Statistics ---\n\
@@ -314,47 +583,70 @@ impl QueryStats {
              Errors:    {}\n\
              Elapsed:   {:.1}s\n\
              QPS:       {:.1} q/s\n\
-             RTT:       {} (min/avg/max/mdev)",
+             RTT:       {} (min/avg/max/mdev)\n\
+             Pctl:      {:.1}/{:.1}/{:.1} ms (p50/p95/p99)\n\
+             Status:    {}",
             completed,
             succeeded,
             errors,
             elapsed.as_secs_f64(),
             self.qps(),
-            rtt_str
+            rtt_str,
+            p50,
+            p95,
+            p99,
+            status_str
         )
     }
 
-    /// Format statistics as a JSON object for --stats --json
-    fn format_summary_json(&self) -> String {
+    /// Build the statistics object (the inner value, without the "stats" wrapper),
+    /// shared by --stats --json and the --json-array trailer.
+    fn stats_value(&self) -> serde_json::Value {
         let completed = self.completed.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
         let succeeded = completed - errors;
         let elapsed = self.start.elapsed().as_secs_f64();
 
-        let (rtt_min, rtt_avg, rtt_max, rtt_mdev) = if let Ok(rtt) = self.rtt.lock() {
+        let (rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock()
+        {
             if rtt.count > 0 {
-                (rtt.min_ms, rtt.avg_ms(), rtt.max_ms, rtt.mdev_ms())
+                let (p50, p95, p99) = rtt.percentiles();
+                (rtt.min_ms, rtt.avg_ms(), rtt.max_ms, rtt.mdev_ms(), p50, p95, p99)
             } else {
-                (0.0, 0.0, 0.0, 0.0)
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             }
         } else {
-            (0.0, 0.0, 0.0, 0.0)
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         };
 
+        // Round helper: keep 3 decimals of a millisecond
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+
+        let mut status_counts = serde_json::Map::new();
+        for (k, v) in self.status_counts() {
+            status_counts.insert(k.to_string(), serde_json::json!(v));
+        }
+
         serde_json::json!({
-            "stats": {
-                "queries": completed,
-                "succeeded": succeeded,
-                "errors": errors,
-                "elapsed_sec": (elapsed * 1000.0).round() / 1000.0,
-                "qps": (self.qps() * 10.0).round() / 10.0,
-                "rtt_ms_min": (rtt_min * 1000.0).round() / 1000.0,
-                "rtt_ms_avg": (rtt_avg * 1000.0).round() / 1000.0,
-                "rtt_ms_max": (rtt_max * 1000.0).round() / 1000.0,
-                "rtt_ms_mdev": (rtt_mdev * 1000.0).round() / 1000.0
-            }
+            "queries": completed,
+            "succeeded": succeeded,
+            "errors": errors,
+            "elapsed_sec": r3(elapsed),
+            "qps": (self.qps() * 10.0).round() / 10.0,
+            "rtt_ms_min": r3(rtt_min),
+            "rtt_ms_avg": r3(rtt_avg),
+            "rtt_ms_max": r3(rtt_max),
+            "rtt_ms_mdev": r3(rtt_mdev),
+            "rtt_ms_p50": r3(p50),
+            "rtt_ms_p95": r3(p95),
+            "rtt_ms_p99": r3(p99),
+            "status_counts": serde_json::Value::Object(status_counts)
         })
-        .to_string()
+    }
+
+    /// Format statistics as a JSON object for --stats --json
+    fn format_summary_json(&self) -> String {
+        serde_json::json!({ "stats": self.stats_value() }).to_string()
     }
 }
 
@@ -368,10 +660,25 @@ enum RecordEntry {
     WithPriority { priority: u16, value: String },
 }
 
+impl RecordEntry {
+    /// The comparable string value of a record (the host/value for MX entries).
+    fn value_str(&self) -> &str {
+        match self {
+            RecordEntry::Simple(s) => s,
+            RecordEntry::WithPriority { value, .. } => value,
+        }
+    }
+}
+
 /// Unified structure for handling outputs
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Clone)]
 struct LookupResult {
     query: String,
+    // IDNA/ASCII (punycode) form, populated whenever it differs from `query` (a
+    // name with non-ASCII labels). The original `query` is always preserved; the
+    // field is skipped in JSON for plain ASCII names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    punycode: Option<String>,
     #[serde(rename = "querytype")]
     query_type: String,
     #[serde(skip_serializing)]
@@ -383,27 +690,127 @@ struct LookupResult {
     ttl: Option<u32>,
 }
 
+/// Output-side record/result filters (--match-cidr, --exclude-private, --wildcard-filter)
+struct OutputFilter {
+    match_cidrs: Vec<IpNet>,
+    exclude_private: bool,
+    // parent domain (normalized) -> learned wildcard IP set
+    wildcards: HashMap<String, HashSet<IpAddr>>,
+}
+
+impl OutputFilter {
+    /// Whether any per-record IP filter is active.
+    fn ip_filters_active(&self) -> bool {
+        !self.match_cidrs.is_empty() || self.exclude_private
+    }
+
+    /// Decide whether a single record value passes the IP-based filters.
+    fn record_passes(&self, value: &str) -> bool {
+        match value.parse::<IpAddr>() {
+            Ok(ip) => {
+                if self.exclude_private && is_reserved_ip(ip) {
+                    return false;
+                }
+                if !self.match_cidrs.is_empty() && !self.match_cidrs.iter().any(|n| n.contains(&ip))
+                {
+                    return false;
+                }
+                true
+            }
+            // Non-IP record: nothing to exclude, but it cannot satisfy --match-cidr.
+            Err(_) => self.match_cidrs.is_empty(),
+        }
+    }
+
+    /// Whether this result is a wildcard hit that should be filtered out. Only
+    /// applies to successful A/AAAA answers whose name falls under a learned parent.
+    fn is_wildcard_result(&self, result: &LookupResult) -> bool {
+        if self.wildcards.is_empty() || !result.is_success {
+            return false;
+        }
+        // query_type is stored lowercase; only A/AAAA carry comparable IP sets
+        let qt = result.query_type.as_str();
+        if qt != "a" && qt != "aaaa" {
+            return false;
+        }
+        let host = normalize_host(&result.query);
+        let set = match find_wildcard_parent(&host, &self.wildcards) {
+            Some(s) => s,
+            None => return false,
+        };
+        let ips: Vec<IpAddr> =
+            result.records.iter().filter_map(|r| r.value_str().parse::<IpAddr>().ok()).collect();
+        is_wildcard_hit(&ips, set)
+    }
+}
+
+/// Output configuration passed to LookupResult::print
+struct PrintCfg {
+    json: bool,       // any JSON mode (line-delimited --json or --json-array)
+    json_array: bool, // single-array JSON mode
+    short: bool,
+    punycode: bool,
+    show_only: Vec<String>,
+}
+
 impl LookupResult {
-    fn print(&self, json_output: bool, short: bool, show_only: &[String]) {
+    fn print(&self, cfg: &PrintCfg, filter: &OutputFilter, array_started: &AtomicBool) {
         use std::io::Write;
 
         // Apply --show-only filter: if filters are set, skip non-matching results
-        if !show_only.is_empty() {
+        if !cfg.show_only.is_empty() {
             let category = classify_status(&self.status);
-            if !show_only.iter().any(|f| f == category) {
+            if !cfg.show_only.iter().any(|f| f == category) {
                 return;
             }
         }
 
+        // Wildcard filter: drop A/AAAA answers that match a learned wildcard set
+        if filter.is_wildcard_result(self) {
+            return;
+        }
+
+        // IP-based record filters (--match-cidr / --exclude-private)
+        let active = filter.ip_filters_active();
+        let filtered: Vec<RecordEntry>;
+        let records: &[RecordEntry] = if active {
+            filtered = self
+                .records
+                .iter()
+                .filter(|r| filter.record_passes(r.value_str()))
+                .cloned()
+                .collect();
+            if self.records.is_empty() {
+                // No records to begin with (error/NXDOMAIN/NODATA): --match-cidr can
+                // never match, so suppress; exclude-private alone keeps the status.
+                if !filter.match_cidrs.is_empty() {
+                    return;
+                }
+            } else if filtered.is_empty() {
+                // Had records, but none survived the filter -> suppress the result.
+                return;
+            }
+            &filtered
+        } else {
+            &self.records
+        };
+
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
 
-        if short {
+        // Display name honours --punycode for non-JSON output
+        let name: &str = if cfg.punycode {
+            self.punycode.as_deref().unwrap_or(&self.query)
+        } else {
+            &self.query
+        };
+
+        if cfg.short {
             // --short: only print values for successful lookups, one per line
             if !self.is_success {
                 return;
             }
-            for record in &self.records {
+            for record in records {
                 let res = match record {
                     RecordEntry::WithPriority { priority, value } => {
                         writeln!(out, "{} {}", priority, value)
@@ -419,23 +826,40 @@ impl LookupResult {
             return;
         }
 
-        let res = if json_output {
-            if let Ok(json_str) = serde_json::to_string(self) {
-                writeln!(out, "{}", json_str)
+        let res = if cfg.json {
+            // Serialize with the filtered records (clone only when filtering changed them)
+            let json_str = if active && records.len() != self.records.len() {
+                let mut tmp = self.clone();
+                tmp.records = records.to_vec();
+                serde_json::to_string(&tmp)
             } else {
-                return;
+                serde_json::to_string(self)
+            };
+            let json_str = match json_str {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if cfg.json_array {
+                // Comma-separate elements; the surrounding brackets are written by main.
+                if array_started.swap(true, Ordering::Relaxed) {
+                    write!(out, ",{}", json_str)
+                } else {
+                    write!(out, "{}", json_str)
+                }
+            } else {
+                writeln!(out, "{}", json_str)
             }
         } else if self.is_success {
             // One record per line: "query TYPE [priority]=value"
             let qt = &self.query_type.to_uppercase();
             let mut res = Ok(());
-            for record in &self.records {
+            for record in records {
                 res = match record {
                     RecordEntry::WithPriority { priority, value } => {
-                        writeln!(out, "{} {} {}={}", self.query, qt, priority, value)
+                        writeln!(out, "{} {} {}={}", name, qt, priority, value)
                     }
                     RecordEntry::Simple(value) => {
-                        writeln!(out, "{} {}={}", self.query, qt, value)
+                        writeln!(out, "{} {}={}", name, qt, value)
                     }
                 };
                 if res.is_err() {
@@ -444,7 +868,7 @@ impl LookupResult {
             }
             res
         } else {
-            writeln!(out, "{}:{}", self.query, self.status)
+            writeln!(out, "{}:{}", name, self.status)
         };
 
         if res.is_err() {
@@ -454,6 +878,22 @@ impl LookupResult {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
+
+/// Write a raw string to stdout, suspending the progress bar if one is active so
+/// the output is not clobbered by an in-flight bar redraw.
+fn emit_raw(pb: &Option<ProgressBar>, s: &str) {
+    use std::io::Write;
+    let write_it = || {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let _ = write!(out, "{}", s);
+        let _ = out.flush();
+    };
+    match pb {
+        Some(pb) => pb.suspend(write_it),
+        None => write_it(),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -517,6 +957,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
         .build()?;
+
+    // Learn wildcard address sets up front (if --wildcard-filter FILE is given), so
+    // results can be filtered against them during the main resolution pass.
+    let wildcards: HashMap<String, HashSet<IpAddr>> = if let Some(path) = &args.wildcard_filter {
+        match learn_wildcards(&resolver, path, 3).await {
+            Ok(map) => {
+                if !map.is_empty() {
+                    eprintln!("wildcard: detected wildcards for {} parent domain(s)", map.len());
+                }
+                map
+            }
+            Err(e) => {
+                eprintln!("error: failed to read wildcard filter file '{}': {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        HashMap::new()
+    };
 
     // Determine file size for progress bar (if -i points to a regular file)
     let (file_size, is_regular_file) = if let Some(path) = &args.input {
@@ -640,10 +1099,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let effective_types = Arc::new(effective_types);
-    let json_mode = args.json;
-    let short_mode = args.short;
-    let show_only: Arc<Vec<String>> = Arc::new(args.show_only.clone());
-    let include_ttl = args.ttl && args.json; // TTL only meaningful with --json
+    let include_ttl = args.ttl && (args.json || args.json_array); // TTL only meaningful in JSON
+
+    // Output filters and print configuration (shared, read-only during the run)
+    let output_filter = Arc::new(OutputFilter {
+        match_cidrs: args.match_cidr.clone(),
+        exclude_private: args.exclude_private,
+        wildcards,
+    });
+    let print_cfg = Arc::new(PrintCfg {
+        json: args.json || args.json_array,
+        json_array: args.json_array,
+        short: args.short,
+        punycode: args.punycode,
+        show_only: args.show_only.clone(),
+    });
+    // Tracks whether the first element of a --json-array has been written (for commas)
+    let array_started = Arc::new(AtomicBool::new(false));
 
     // Expand each input into one work item per query type
     let work_stream = input_stream.flat_map(move |input| {
@@ -666,10 +1138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         async move {
             let start = Instant::now();
-            let result = typed_lookup(input, resolver, &query_type, include_ttl).await;
+            let mut result = typed_lookup(input, resolver, &query_type, include_ttl).await;
             let elapsed = start.elapsed();
 
-            stats.record_completion(result.is_success, elapsed);
+            // Always expose the punycode form in JSON when it differs from the query
+            // (i.e. the name had non-ASCII labels); omitted for plain ASCII names.
+            result.punycode = punycode_if_different(&result.query);
+
+            stats.record_completion(result.is_success, &result.status, elapsed);
             if let Some(ref pb) = pb {
                 pb.set_message(stats.format_progress());
             }
@@ -681,6 +1157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clone handles for the output closure
     let pb_output = progress_bar.clone();
 
+    // Open the JSON array document, if requested, before any results stream out
+    if args.json_array {
+        let prefix = if args.stats { "{\"results\":[" } else { "[" };
+        emit_raw(&pb_output, prefix);
+    }
+
     // Execute with Concurrency Control
     // We switch between buffered (ordered) and buffer_unordered (immediate)
     if args.unordered {
@@ -688,12 +1170,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .buffer_unordered(args.concurrency)
             .for_each(|result| {
                 let pb = pb_output.clone();
-                let show_only = show_only.clone();
+                let cfg = print_cfg.clone();
+                let filter = output_filter.clone();
+                let astate = array_started.clone();
                 async move {
                     if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(json_mode, short_mode, &show_only));
+                        pb.suspend(|| result.print(&cfg, &filter, &astate));
                     } else {
-                        result.print(json_mode, short_mode, &show_only);
+                        result.print(&cfg, &filter, &astate);
                     }
                 }
             })
@@ -703,12 +1187,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .buffered(args.concurrency)
             .for_each(|result| {
                 let pb = pb_output.clone();
-                let show_only = show_only.clone();
+                let cfg = print_cfg.clone();
+                let filter = output_filter.clone();
+                let astate = array_started.clone();
                 async move {
                     if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(json_mode, short_mode, &show_only));
+                        pb.suspend(|| result.print(&cfg, &filter, &astate));
                     } else {
-                        result.print(json_mode, short_mode, &show_only);
+                        result.print(&cfg, &filter, &astate);
                     }
                 }
             })
@@ -721,8 +1207,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pb.finish_and_clear();
     }
 
-    // Print statistics summary (--stats)
-    if args.stats {
+    // Close the JSON array (embedding stats when requested), or otherwise print the
+    // statistics summary in the existing line-delimited / text form.
+    if args.json_array {
+        use std::io::Write;
+        let suffix = if args.stats {
+            format!("],\"stats\":{}}}\n", stats.stats_value())
+        } else {
+            "]\n".to_string()
+        };
+        let _ = write!(std::io::stdout().lock(), "{}", suffix);
+    } else if args.stats {
         if args.json {
             use std::io::Write;
             let _ = writeln!(std::io::stdout().lock(), "{}", stats.format_summary_json());
@@ -763,6 +1258,7 @@ fn classify_resolve_error(e: &NetError) -> String {
 fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
     LookupResult {
         query: input,
+        punycode: None,
         query_type: qt_lower,
         is_success: false,
         status: classify_resolve_error(e), // Now consumes the generated String
@@ -799,6 +1295,7 @@ fn lookup_success(
 ) -> LookupResult {
     LookupResult {
         query: input,
+        punycode: None,
         query_type: qt_lower,
         is_success: !records.is_empty(),
         status: if records.is_empty() {
@@ -809,6 +1306,58 @@ fn lookup_success(
         records,
         ttl,
     }
+}
+
+/// Learn the wildcard address sets for the parent domains listed in `path`.
+///
+/// For each parent, a few random non-existent labels are resolved (A and AAAA);
+/// the union of returned addresses is that parent's wildcard set. Parents with no
+/// wildcard (NXDOMAIN for the random probes) are omitted. The resulting map is then
+/// used by OutputFilter to drop answers that only ever return wildcard addresses.
+async fn learn_wildcards(
+    resolver: &TokioResolver,
+    path: &str,
+    probes: usize,
+) -> std::io::Result<HashMap<String, HashSet<IpAddr>>> {
+    let content = tokio::fs::read_to_string(path).await?;
+
+    // Normalize + dedup parent domains
+    let parents: Vec<String> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(normalize_host)
+        .filter(|p| !p.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let mut map = HashMap::new();
+    for parent in parents {
+        let mut set = HashSet::new();
+        for _ in 0..probes {
+            let probe = format!("{}.{}", random_label(), parent);
+            if let Ok(lookup) = resolver.ipv4_lookup(probe.as_str()).await {
+                for r in lookup.answers() {
+                    if let RData::A(a) = &r.data {
+                        set.insert(IpAddr::V4(a.0));
+                    }
+                }
+            }
+            if let Ok(lookup) = resolver.ipv6_lookup(probe.as_str()).await {
+                for r in lookup.answers() {
+                    if let RData::AAAA(a) = &r.data {
+                        set.insert(IpAddr::V6(a.0));
+                    }
+                }
+            }
+        }
+        // Only keep parents that actually exhibit a wildcard
+        if !set.is_empty() {
+            map.insert(parent, set);
+        }
+    }
+    Ok(map)
 }
 
 /// Perform a DNS lookup for the given query type
@@ -1087,4 +1636,298 @@ async fn typed_lookup(
 // Helper dependency for the stream macro
 mod async_stream {
     pub use async_stream::stream;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn mk_result(query: &str, qt_lower: &str, ips: &[&str]) -> LookupResult {
+        let records = ips.iter().map(|s| RecordEntry::Simple(s.to_string())).collect::<Vec<_>>();
+        LookupResult {
+            query: query.to_string(),
+            punycode: None,
+            query_type: qt_lower.to_string(),
+            is_success: !records.is_empty(),
+            status: if records.is_empty() {
+                "No records found".to_string()
+            } else {
+                "SUCCESS".to_string()
+            },
+            records,
+            ttl: None,
+        }
+    }
+
+    // ── argument validation ──────────────────────────────────────────────────
+    #[test]
+    fn query_type_validation() {
+        assert_eq!(parse_query_type("a").unwrap(), "A");
+        assert_eq!(parse_query_type("AaAa").unwrap(), "AAAA");
+        assert!(parse_query_type("bogus").is_err());
+    }
+
+    #[test]
+    fn show_filter_validation() {
+        assert_eq!(parse_show_filter("success").unwrap(), "SUCCESS");
+        assert!(parse_show_filter("weird").is_err());
+    }
+
+    #[test]
+    fn cidr_validation() {
+        assert!(parse_cidr("10.0.0.0/8").is_ok());
+        assert!(parse_cidr("2001:db8::/32").is_ok());
+        assert!(parse_cidr("nope").is_err());
+        assert!(parse_cidr("10.0.0.0/40").is_err());
+    }
+
+    #[test]
+    fn dedup_preserves_order() {
+        let got = dedup_types(&["A".into(), "MX".into(), "A".into(), "AAAA".into(), "MX".into()]);
+        assert_eq!(got, vec!["A", "MX", "AAAA"]);
+    }
+
+    #[test]
+    fn classify_status_buckets() {
+        assert_eq!(classify_status("SUCCESS"), "SUCCESS");
+        assert_eq!(classify_status("No records found"), "NODATA");
+        assert_eq!(classify_status("TIMEOUT"), "TEMP");
+        assert_eq!(classify_status("SERVFAIL"), "TEMP");
+    }
+
+    // ── punycode ─────────────────────────────────────────────────────────────
+    #[test]
+    fn punycode_ascii_passthrough() {
+        // ASCII names (any case) are returned exactly as typed
+        assert_eq!(to_punycode("example.com"), "example.com");
+        assert_eq!(to_punycode("EXAMPLE.Com"), "EXAMPLE.Com");
+        assert_eq!(to_punycode("8.8.8.8"), "8.8.8.8");
+    }
+
+    #[test]
+    fn punycode_idn_conversion() {
+        // Well-known punycode encodings
+        assert_eq!(to_punycode("münchen.de"), "xn--mnchen-3ya.de");
+        assert_eq!(to_punycode("bücher.example"), "xn--bcher-kva.example");
+        // trailing-dot convention is preserved
+        assert_eq!(to_punycode("münchen.de."), "xn--mnchen-3ya.de.");
+    }
+
+    #[test]
+    fn punycode_if_different_omits_ascii() {
+        // ASCII / already-punycode names add nothing -> None (JSON omits the field)
+        assert_eq!(punycode_if_different("example.com"), None);
+        assert_eq!(punycode_if_different("8.8.8.8"), None);
+        assert_eq!(punycode_if_different("xn--mnchen-3ya.de"), None);
+        // IDN names yield the punycode form
+        assert_eq!(punycode_if_different("münchen.de").as_deref(), Some("xn--mnchen-3ya.de"));
+    }
+
+    #[test]
+    fn normalize_host_lowercases_and_trims() {
+        assert_eq!(normalize_host("  Example.COM. "), "example.com");
+        assert_eq!(normalize_host("München.de"), "xn--mnchen-3ya.de");
+    }
+
+    // ── percentiles / RTT ────────────────────────────────────────────────────
+    #[test]
+    fn percentile_math() {
+        let v: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+        assert!((percentile(&v, 50.0) - 50.5).abs() < 1e-9);
+        assert!((percentile(&v, 95.0) - 95.05).abs() < 1e-9);
+        assert!((percentile(&v, 99.0) - 99.01).abs() < 1e-9);
+        assert_eq!(percentile(&[], 50.0), 0.0);
+        assert_eq!(percentile(&[7.0], 99.0), 7.0);
+    }
+
+    #[test]
+    fn rtt_tracker_percentiles() {
+        let mut t = RttTracker::new();
+        for ms in 1..=100u64 {
+            t.record(Duration::from_millis(ms));
+        }
+        let (p50, p95, p99) = t.percentiles();
+        assert!((p50 - 50.5).abs() < 1e-6);
+        assert!((p95 - 95.05).abs() < 1e-6);
+        assert!((p99 - 99.01).abs() < 1e-6);
+        assert_eq!(RttTracker::new().percentiles(), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn stats_bucket_mapping() {
+        assert_eq!(stats_bucket("SUCCESS"), "success");
+        assert_eq!(stats_bucket("No records found"), "nodata");
+        assert_eq!(stats_bucket("NODATA"), "nodata");
+        assert_eq!(stats_bucket("TIMEOUT"), "timeout");
+        assert_eq!(stats_bucket("REFUSED"), "refused");
+        assert_eq!(stats_bucket("PROTO_ERR: x"), "other");
+    }
+
+    #[test]
+    fn query_stats_counts_and_json() {
+        let s = QueryStats::new(false);
+        s.record_completion(true, "SUCCESS", Duration::from_millis(10));
+        s.record_completion(false, "NXDOMAIN", Duration::from_millis(20));
+        s.record_completion(false, "TIMEOUT", Duration::from_millis(30));
+        let counts = s.status_counts();
+        assert!(counts.contains(&("success", 1)));
+        assert!(counts.contains(&("nxdomain", 1)));
+        assert!(counts.contains(&("timeout", 1)));
+        let v = s.stats_value();
+        assert_eq!(v["queries"], 3);
+        assert_eq!(v["succeeded"], 1);
+        assert_eq!(v["errors"], 2);
+        assert!(v["status_counts"]["success"] == 1);
+    }
+
+    // ── reserved IPs ─────────────────────────────────────────────────────────
+    #[test]
+    fn reserved_ip_detection() {
+        for s in ["10.1.2.3", "192.168.1.1", "172.16.5.5", "100.64.1.1", "127.0.0.1", "169.254.0.1"]
+        {
+            assert!(is_reserved_ip(ip(s)), "{} should be reserved", s);
+        }
+        for s in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "203.0.114.1"] {
+            assert!(!is_reserved_ip(ip(s)), "{} should be public", s);
+        }
+        for s in ["::1", "fe80::1", "fc00::1", "fd12:3456::1", "2001:db8::1"] {
+            assert!(is_reserved_ip(ip(s)), "{} should be reserved", s);
+        }
+        assert!(!is_reserved_ip(ip("2606:4700:4700::1111")));
+    }
+
+    // ── output filter ────────────────────────────────────────────────────────
+    #[test]
+    fn filter_match_cidr() {
+        let f = OutputFilter {
+            match_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(f.ip_filters_active());
+        assert!(f.record_passes("10.1.2.3"));
+        assert!(!f.record_passes("8.8.8.8"));
+        assert!(!f.record_passes("mail.example.com")); // non-IP can't satisfy --match-cidr
+    }
+
+    #[test]
+    fn filter_match_cidr_prefix_semantics() {
+        let narrow = OutputFilter {
+            match_cidrs: vec!["157.0.0.0/16".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(!narrow.record_passes("157.124.1.11"));
+        let wide = OutputFilter {
+            match_cidrs: vec!["157.0.0.0/8".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(wide.record_passes("157.124.1.11"));
+        let exact = OutputFilter {
+            match_cidrs: vec!["157.124.0.0/16".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(exact.record_passes("157.124.1.11"));
+    }
+
+    #[test]
+    fn filter_match_cidr_ipv6() {
+        let f = OutputFilter {
+            match_cidrs: vec!["2001:db8::/32".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(f.record_passes("2001:db8::1"));
+        assert!(f.record_passes("2001:db8:dead:beef::5"));
+        assert!(!f.record_passes("2001:4860:4860::8888")); // outside 2001:db8::/32
+        assert!(!f.record_passes("8.8.8.8")); // v4 never matches a v6-only filter
+
+        // Mixed-family filter: a v4 and a v6 CIDR together
+        let mixed = OutputFilter {
+            match_cidrs: vec!["10.0.0.0/8".parse().unwrap(), "2001:db8::/32".parse().unwrap()],
+            exclude_private: false,
+            wildcards: HashMap::new(),
+        };
+        assert!(mixed.record_passes("10.1.2.3"));
+        assert!(mixed.record_passes("2001:db8::1"));
+        assert!(!mixed.record_passes("9.9.9.9"));
+        assert!(!mixed.record_passes("2001:4860:4860::8888"));
+    }
+
+    #[test]
+    fn filter_exclude_private() {
+        let f =
+            OutputFilter { match_cidrs: vec![], exclude_private: true, wildcards: HashMap::new() };
+        assert!(!f.record_passes("10.1.2.3"));
+        assert!(!f.record_passes("fc00::1"));
+        assert!(f.record_passes("8.8.8.8"));
+        assert!(f.record_passes("mail.example.com")); // non-IP kept; nothing to exclude
+    }
+
+    #[test]
+    fn filter_inactive() {
+        let f =
+            OutputFilter { match_cidrs: vec![], exclude_private: false, wildcards: HashMap::new() };
+        assert!(!f.ip_filters_active());
+        assert!(f.record_passes("whatever"));
+        assert!(f.record_passes("10.0.0.1"));
+    }
+
+    // ── wildcard filtering ───────────────────────────────────────────────────
+    #[test]
+    fn wildcard_parent_lookup() {
+        let mut m: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        m.insert("example.com".into(), HashSet::from([ip("1.2.3.4")]));
+        m.insert("sub.example.com".into(), HashSet::from([ip("5.6.7.8")]));
+        assert!(find_wildcard_parent("a.sub.example.com", &m).unwrap().contains(&ip("5.6.7.8")));
+        assert!(find_wildcard_parent("foo.example.com", &m).unwrap().contains(&ip("1.2.3.4")));
+        assert!(find_wildcard_parent("example.com", &m).is_some());
+        assert!(find_wildcard_parent("notexample.com", &m).is_none());
+        assert!(find_wildcard_parent("other.org", &m).is_none());
+    }
+
+    #[test]
+    fn wildcard_hit_rules() {
+        let set = HashSet::from([ip("1.2.3.4"), ip("1.2.3.5")]);
+        assert!(is_wildcard_hit(&[ip("1.2.3.4")], &set));
+        assert!(is_wildcard_hit(&[ip("1.2.3.4"), ip("1.2.3.5")], &set));
+        assert!(!is_wildcard_hit(&[ip("1.2.3.4"), ip("9.9.9.9")], &set)); // a real IP -> keep
+        assert!(!is_wildcard_hit(&[], &set));
+        assert!(!is_wildcard_hit(&[ip("1.2.3.4")], &HashSet::new()));
+    }
+
+    #[test]
+    fn wildcard_result_decision() {
+        let mut wildcards: HashMap<String, HashSet<IpAddr>> = HashMap::new();
+        wildcards.insert("example.com".into(), HashSet::from([ip("1.2.3.4")]));
+        let f = OutputFilter { match_cidrs: vec![], exclude_private: false, wildcards };
+
+        // A answer that only returns the wildcard IP -> filtered
+        assert!(f.is_wildcard_result(&mk_result("foo.example.com", "a", &["1.2.3.4"])));
+        // A answer with a non-wildcard IP -> kept
+        assert!(!f.is_wildcard_result(&mk_result("foo.example.com", "a", &["1.2.3.4", "9.9.9.9"])));
+        // Not under a known parent -> kept
+        assert!(!f.is_wildcard_result(&mk_result("foo.other.org", "a", &["1.2.3.4"])));
+        // Non A/AAAA type -> never wildcard-filtered
+        assert!(!f.is_wildcard_result(&mk_result("foo.example.com", "mx", &["1.2.3.4"])));
+        // No wildcards configured -> never filtered
+        let empty =
+            OutputFilter { match_cidrs: vec![], exclude_private: false, wildcards: HashMap::new() };
+        assert!(!empty.is_wildcard_result(&mk_result("foo.example.com", "a", &["1.2.3.4"])));
+    }
+
+    #[test]
+    fn record_entry_value_str() {
+        assert_eq!(RecordEntry::Simple("x".into()).value_str(), "x");
+        assert_eq!(
+            RecordEntry::WithPriority { priority: 10, value: "mail.x".into() }.value_str(),
+            "mail.x"
+        );
+    }
 }

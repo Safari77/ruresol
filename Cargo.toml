@@ -15,6 +15,7 @@ serde_json = "1.0"
 indicatif = { version = "0.18", features = ["improved_unicode"] }
 rand = "0.10"
 libc = "0.2"
+ipnet = "2"
 
 [profile.release]
 opt-level = 3
