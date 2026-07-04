@@ -34,7 +34,7 @@ struct Args {
     resolver: Vec<String>,
 
     /// Use DNS-over-HTTPS (Routes via Cloudflare's secure endpoint)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resolver")]
     doh: bool,
 
     /// Concurrency limit (number of simultaneous requests)
@@ -87,7 +87,7 @@ struct Args {
     progress: bool,
 
     /// Only print record values (no query name, no type prefix). Errors are suppressed.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["json", "json_array"])]
     short: bool,
 
     /// Print query statistics summary after completion
@@ -442,9 +442,10 @@ struct QueryStats {
     submitted: AtomicU64,
     completed: AtomicU64,
     errors: AtomicU64,
-    bytes_read: AtomicU64,
     eof_reached: AtomicBool,
-    file_input: bool, // true if -i with a regular file (known size)
+    // Exact number of queries when knowable upfront (regular -i file pre-scan, or only
+    // -- args); None for pipes/stdin where the total emerges only as input is consumed.
+    expected_total: Option<u64>,
     start: Instant,
     rtt: Mutex<RttTracker>,
     // Per-status bucket counters (see stats_bucket)
@@ -459,14 +460,13 @@ struct QueryStats {
 }
 
 impl QueryStats {
-    fn new(file_input: bool) -> Self {
+    fn new(expected_total: Option<u64>) -> Self {
         Self {
             submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             errors: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
             eof_reached: AtomicBool::new(false),
-            file_input,
+            expected_total,
             start: Instant::now(),
             rtt: Mutex::new(RttTracker::new()),
             status_success: AtomicU64::new(0),
@@ -480,12 +480,16 @@ impl QueryStats {
         }
     }
 
-    fn record_completion(&self, is_success: bool, status: &str, duration: Duration) {
+    fn record_completion(&self, status: &str, duration: Duration) {
         self.completed.fetch_add(1, Ordering::Relaxed);
-        if !is_success {
+        let bucket = stats_bucket(status);
+        // NXDOMAIN and NODATA are definitive negative answers, not transient errors,
+        // so they are excluded from the error count (only timeout/servfail/refused/other).
+        let is_error = !matches!(bucket, "success" | "ptrmatch" | "nxdomain" | "nodata");
+        if is_error {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
-        self.bump_status(stats_bucket(status));
+        self.bump_status(bucket);
         if let Ok(mut rtt) = self.rtt.lock() {
             rtt.record(duration);
         }
@@ -526,6 +530,12 @@ impl QueryStats {
         .collect()
     }
 
+    /// Number of genuinely successful lookups (SUCCESS + PTRMATCH). NXDOMAIN and NODATA
+    /// are definitive answers but are counted as neither successes nor errors here.
+    fn succeeded(&self) -> u64 {
+        self.status_success.load(Ordering::Relaxed) + self.status_ptrmatch.load(Ordering::Relaxed)
+    }
+
     fn qps(&self) -> f64 {
         let completed = self.completed.load(Ordering::Relaxed) as f64;
         let elapsed = self.start.elapsed().as_secs_f64();
@@ -539,8 +549,13 @@ impl QueryStats {
         let errors = self.errors.load(Ordering::Relaxed);
         let eof = self.eof_reached.load(Ordering::Relaxed);
 
-        let total_str =
-            if self.file_input || eof { format!("{}", submitted) } else { "?".to_string() };
+        let total_str = match self.expected_total {
+            // Exact total known upfront (regular-file pre-scan or -- args only)
+            Some(total) => format!("{}", total),
+            // Otherwise the best we know: everything submitted so far, exact once EOF is hit
+            None if eof => format!("{}", submitted),
+            None => "?".to_string(),
+        };
 
         let rtt_str =
             if let Ok(rtt) = self.rtt.lock() { rtt.format_rtt() } else { "-/-/-/- ms".to_string() };
@@ -559,7 +574,7 @@ impl QueryStats {
     fn format_summary(&self) -> String {
         let completed = self.completed.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
-        let succeeded = completed - errors;
+        let succeeded = self.succeeded();
         let elapsed = self.start.elapsed();
 
         // Compute the RTT string and percentiles under a single lock
@@ -604,7 +619,7 @@ impl QueryStats {
     fn stats_value(&self) -> serde_json::Value {
         let completed = self.completed.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
-        let succeeded = completed - errors;
+        let succeeded = self.succeeded();
         let elapsed = self.start.elapsed().as_secs_f64();
 
         let (rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock()
@@ -819,9 +834,7 @@ impl LookupResult {
                         writeln!(out, "{}", value)
                     }
                 };
-                if res.is_err() {
-                    std::process::exit(0);
-                }
+                handle_write(res);
             }
             return;
         }
@@ -850,8 +863,10 @@ impl LookupResult {
                 writeln!(out, "{}", json_str)
             }
         } else if self.is_success {
-            // One record per line: "query TYPE [priority]=value"
-            let qt = &self.query_type.to_uppercase();
+            // One record per line: "query type [priority]=value"
+            // querytype is stored lowercase; keep it lowercase in plain output too so it
+            // matches the JSON "querytype" field.
+            let qt = &self.query_type;
             let mut res = Ok(());
             for record in records {
                 res = match record {
@@ -871,9 +886,7 @@ impl LookupResult {
             writeln!(out, "{}:{}", name, self.status)
         };
 
-        if res.is_err() {
-            std::process::exit(0);
-        }
+        handle_write(res);
     }
 }
 
@@ -895,13 +908,51 @@ fn emit_raw(pb: &Option<ProgressBar>, s: &str) {
     }
 }
 
+/// Handle the result of a stdout write. A broken pipe (the downstream reader closed,
+/// e.g. `... | head`) is an expected, clean termination -> exit(0). Any other write
+/// error (e.g. disk full when redirected to a file) is a real failure -> exit(1) so
+/// callers can detect it. This relies on SIGPIPE being ignored (Rust's default), so a
+/// broken pipe surfaces here as an Err rather than a fatal signal.
+fn handle_write(res: std::io::Result<()>) {
+    if let Err(e) = res {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("error writing to stdout: {}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Pre-scan a regular input file and count the lines that will actually be queried,
+/// applying the same filter as the input stream (valid UTF-8, trimmed non-empty, not a
+/// '#' comment). Returns None if the file can't be opened. Only called for regular
+/// files; pipes/stdin can't be rewound and are never pre-scanned.
+async fn count_input_lines(path: &str) -> Option<u64> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut count: u64 = 0;
+    while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf).await {
+        if bytes_read == 0 {
+            break; // EOF
+        }
+        if let Ok(line_str) = std::str::from_utf8(&buf) {
+            let trimmed = line_str.trim();
+            if !trimmed.starts_with('#') && !trimmed.is_empty() {
+                count += 1;
+            }
+        }
+        buf.clear();
+    }
+    Some(count)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
+    // NOTE: SIGPIPE is left at Rust's default (SIG_IGN), so writes to a closed downstream
+    // pipe return Err(BrokenPipe) instead of terminating the process with a signal.
+    // handle_write() turns a broken pipe into a clean exit(0) and any other write error
+    // into exit(1), giving correct exit codes without depending on signal delivery.
     let args = Args::parse();
 
     // Deduplicate query types while preserving order
@@ -920,6 +971,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Validate numeric limits that would otherwise panic or silently produce no output.
+    if args.concurrency == 0 {
+        eprintln!("error: --concurrency must be at least 1");
+        std::process::exit(1);
+    }
+    if args.rate_limit == Some(0) {
+        eprintln!("error: --rate-limit must be at least 1 (queries per second)");
+        std::process::exit(1);
+    }
+
+    // NOTE: The custom (`-R`) and DoH branches below use ResolverOpts::default(), while
+    // the system branch keeps whatever read_system_conf() returns. As a result, search
+    // domains, ndots, and similar resolution behaviour differ between them: a bare name
+    // like "foo" may be search-suffixed by the system resolver but queried literally via
+    // `-R 8.8.8.8` or `--doh`. This is intentional for a bulk tool, but callers relying
+    // on search-list expansion should pass fully-qualified names.
     // Initialize Resolver Config (Custom vs System Default)
     let (config, mut opts) = if args.doh {
         (ResolverConfig::https(&CLOUDFLARE), ResolverOpts::default())
@@ -977,18 +1044,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         HashMap::new()
     };
 
-    // Determine file size for progress bar (if -i points to a regular file)
-    let (file_size, is_regular_file) = if let Some(path) = &args.input {
-        if path != "-" {
-            match tokio::fs::metadata(path).await {
-                Ok(meta) if meta.is_file() => (meta.len(), true),
-                _ => (0, false),
-            }
-        } else {
-            (0, false)
-        }
+    // Determine whether -i points to a regular file (affects the progress total display).
+    let is_regular_file = if let Some(path) = &args.input {
+        path != "-" && matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.is_file())
     } else {
-        (0, false)
+        false
     };
 
     // Setup Input Reading (None when --no-stdin and no -i file)
@@ -1005,8 +1065,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Box::new(BufReader::new(tokio::io::stdin())))
     };
 
-    let mut interval =
-        args.rate_limit.map(|qps| tokio::time::interval(Duration::from_micros(1_000_000 / qps)));
+    // Rate limiter: qps is validated >= 1 above. Use nanosecond precision and clamp the
+    // period to >= 1ns so a very large QPS can't produce a zero-length interval (which
+    // would panic). The Delay policy prevents a burst of catch-up ticks after the pipeline
+    // stalls while the concurrency buffer is full.
+    let mut interval = args.rate_limit.map(|qps| {
+        let period = Duration::from_nanos((1_000_000_000u64 / qps).max(1));
+        let mut i = tokio::time::interval(period);
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        i
+    });
 
     // Collect extra domains passed after --
     let mut extra_domains: Vec<String> =
@@ -1018,30 +1086,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         extra_domains.shuffle(&mut rand::rng());
     }
 
-    // Initialize statistics tracking (used by --progress and --stats)
-    let stats = Arc::new(QueryStats::new(is_regular_file));
-
-    // Initialize progress bar (if --progress)
-    let progress_bar: Option<ProgressBar> = if args.progress {
-        let pb = if is_regular_file && file_size > 0 {
-            let pb = ProgressBar::new(file_size);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{bar:30.cyan/blue} {percent:>3}% | {msg}")
-                    .unwrap_or_else(|_| ProgressStyle::default_bar())
-                    .progress_chars("█▓░"),
-            );
-            pb
+    // When the input size is knowable upfront -- a regular -i file (pre-scanned) or only
+    // `--` arguments -- compute the exact number of queries so the progress bar shows true
+    // completion percentage. This matters with --rate-limit, where submission is throttled
+    // to match completion and a dynamic completed/submitted bar would always read 100%.
+    // Pipes/stdin can't be pre-counted and fall back to the dynamic total.
+    let expected_total: Option<u64> = if args.progress {
+        let types_count = effective_types.len() as u64;
+        let extras = extra_domains.len() as u64;
+        if is_regular_file {
+            // Costs one extra sequential read of the file before querying starts, which is
+            // negligible next to the DNS traffic itself. If the file changes between this
+            // scan and the actual read, the bar may end short of (or be capped at) 100%.
+            if let Some(path) = &args.input {
+                count_input_lines(path).await.map(|lines| (lines + extras) * types_count)
+            } else {
+                None
+            }
+        } else if reader.is_none() {
+            // Only -- args: the total is exact without any scan.
+            Some(extras * types_count)
         } else {
-            // Pipe / stdin / unknown size: use spinner
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.cyan} {msg}")
-                    .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-            );
-            pb
-        };
+            None
+        }
+    } else {
+        None
+    };
+
+    // Initialize statistics tracking (used by --progress and --stats)
+    let stats = Arc::new(QueryStats::new(expected_total));
+
+    // Initialize progress bar (if --progress). The bar tracks completed queries. When the
+    // total is known upfront (regular -i file or -- args only) the length is exact and
+    // fixed; otherwise it grows to the number of queries submitted so far (finalized at
+    // input EOF) while the position tracks completions.
+    let progress_bar: Option<ProgressBar> = if args.progress {
+        let pb = ProgressBar::new(expected_total.unwrap_or(0));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{bar:30.cyan/blue} {percent:>3}% | {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("█▓░"),
+        );
         pb.enable_steady_tick(Duration::from_millis(100));
         Some(pb)
     } else {
@@ -1050,15 +1136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Clone handles for the input stream
     let stats_stream = stats.clone();
-    let pb_stream = progress_bar.clone();
 
     // manual UTF-8 check instead of lines()
     let input_stream = async_stream::stream! {
         // First yield extra domains from command line (after --)
         for domain in &extra_domains {
-            if let Some(i) = &mut interval {
-                i.tick().await;
-            }
             yield domain.clone();
         }
 
@@ -1070,16 +1152,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stats_stream.eof_reached.store(true, Ordering::Relaxed);
                     break;
                 } // EOF
-
-                stats_stream.bytes_read.fetch_add(bytes_read as u64, Ordering::Relaxed);
-                if let Some(ref pb) = pb_stream
-                    && is_regular_file {
-                        pb.set_position(stats_stream.bytes_read.load(Ordering::Relaxed));
-                    }
-
-                if let Some(i) = &mut interval {
-                    i.tick().await;
-                }
 
                 // Check if valid UTF-8. If valid, process. If not, we basically ignore (skip) it.
                 if let Ok(line_str) = std::str::from_utf8(&buf) {
@@ -1125,11 +1197,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         futures::stream::iter(pairs)
     });
 
+    // Rate limit at the per-query granularity so --rate-limit is honored across *all*
+    // query types (each input expands into one work item per --type). Ticking here, after
+    // flat_map, throttles every actual DNS query rather than every input line.
+    let rate_limited = async_stream::stream! {
+        futures::pin_mut!(work_stream);
+        while let Some(item) = work_stream.next().await {
+            if let Some(i) = &mut interval {
+                i.tick().await;
+            }
+            yield item;
+        }
+    };
+
     // Clone handles for the task closures
     let stats_task = stats.clone();
     let pb_task = progress_bar.clone();
 
-    let tasks = work_stream.map(move |(input, query_type)| {
+    let tasks = rate_limited.map(move |(input, query_type)| {
         let resolver = resolver.clone();
         let stats = stats_task.clone();
         let pb = pb_task.clone();
@@ -1145,8 +1230,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // (i.e. the name had non-ASCII labels); omitted for plain ASCII names.
             result.punycode = punycode_if_different(&result.query);
 
-            stats.record_completion(result.is_success, &result.status, elapsed);
+            stats.record_completion(&result.status, elapsed);
             if let Some(ref pb) = pb {
+                // With an exact pre-counted total the bar length is fixed at creation;
+                // otherwise (pipe/stdin) it grows with submissions and the bar shows
+                // completed out of submitted-so-far.
+                if stats.expected_total.is_none() {
+                    pb.set_length(stats.submitted.load(Ordering::Relaxed));
+                }
+                pb.set_position(stats.completed.load(Ordering::Relaxed));
                 pb.set_message(stats.format_progress());
             }
 
@@ -1267,25 +1359,6 @@ fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
     }
 }
 
-/// Fetch minimum TTL for a given name and record type via generic lookup.
-/// Uses the resolver cache, so this won't cause an extra network round-trip
-/// when called right after a typed lookup for the same name/type.
-async fn fetch_ttl(
-    resolver: &TokioResolver,
-    name: &str,
-    record_type: RecordType,
-    include_ttl: bool,
-) -> Option<u32> {
-    if !include_ttl {
-        return None;
-    }
-    resolver
-        .lookup(name, record_type)
-        .await
-        .ok()
-        .and_then(|l| l.answers().iter().map(|r| r.ttl).min())
-}
-
 /// Helper: build a successful LookupResult
 fn lookup_success(
     input: String,
@@ -1372,7 +1445,8 @@ async fn typed_lookup(
     match query_type {
         "A" => match resolver.ipv4_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::A, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1387,7 +1461,8 @@ async fn typed_lookup(
         },
         "AAAA" => match resolver.ipv6_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::AAAA, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1402,7 +1477,8 @@ async fn typed_lookup(
         },
         "MX" => match resolver.mx_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::MX, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1420,7 +1496,8 @@ async fn typed_lookup(
         },
         "NS" => match resolver.ns_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::NS, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1435,7 +1512,8 @@ async fn typed_lookup(
         },
         "TXT" => match resolver.txt_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::TXT, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1450,7 +1528,8 @@ async fn typed_lookup(
         },
         "SOA" => match resolver.soa_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SOA, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1474,7 +1553,8 @@ async fn typed_lookup(
         },
         "SRV" => match resolver.srv_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl = fetch_ttl(&resolver, input.as_str(), RecordType::SRV, include_ttl).await;
+                let ttl =
+                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
                 let records: Vec<RecordEntry> = lookup
                     .answers()
                     .iter()
@@ -1769,18 +1849,18 @@ mod tests {
 
     #[test]
     fn query_stats_counts_and_json() {
-        let s = QueryStats::new(false);
-        s.record_completion(true, "SUCCESS", Duration::from_millis(10));
-        s.record_completion(false, "NXDOMAIN", Duration::from_millis(20));
-        s.record_completion(false, "TIMEOUT", Duration::from_millis(30));
+        let s = QueryStats::new(None);
+        s.record_completion("SUCCESS", Duration::from_millis(10));
+        s.record_completion("NXDOMAIN", Duration::from_millis(20));
+        s.record_completion("TIMEOUT", Duration::from_millis(30));
         let counts = s.status_counts();
         assert!(counts.contains(&("success", 1)));
         assert!(counts.contains(&("nxdomain", 1)));
         assert!(counts.contains(&("timeout", 1)));
         let v = s.stats_value();
         assert_eq!(v["queries"], 3);
-        assert_eq!(v["succeeded"], 1);
-        assert_eq!(v["errors"], 2);
+        assert_eq!(v["succeeded"], 1); // only SUCCESS
+        assert_eq!(v["errors"], 1); // only TIMEOUT; NXDOMAIN is a definitive answer, not an error
         assert!(v["status_counts"]["success"] == 1);
     }
 
