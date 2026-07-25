@@ -16,6 +16,7 @@ indicatif = { version = "0.18", features = ["improved_unicode"] }
 rand = "0.10"
 libc = "0.2"
 ipnet = "2"
+hdrhistogram = { version = "7", default-features = false }
 
 [profile.release]
 opt-level = 3

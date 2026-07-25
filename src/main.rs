@@ -1,5 +1,6 @@
 use clap::Parser;
 use futures::stream::StreamExt;
+use hdrhistogram::Histogram;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
     CLOUDFLARE, ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts,
@@ -207,7 +208,7 @@ fn dedup_types(types: &[String]) -> Vec<String> {
     result
 }
 
-// ─── IDN / punycode, percentile, IP and wildcard helpers ────────────────────
+// ─── IDN / punycode, RTT bounds, IP and wildcard helpers ────────────────────
 
 /// Convert a name to its punycode (IDNA / ASCII) form using the resolver's own
 /// name encoding, so the displayed value matches what is actually queried.
@@ -243,23 +244,26 @@ fn punycode_if_different(input: &str) -> Option<String> {
     if p == input { None } else { Some(p) }
 }
 
-/// Linear-interpolation percentile (R-7 / NumPy default) over a pre-sorted slice.
-/// `p` is in [0, 100]. Returns 0.0 for an empty slice.
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    if sorted.len() == 1 {
-        return sorted[0];
-    }
-    let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
-    let lo = rank.floor() as usize;
-    let hi = rank.ceil() as usize;
-    if lo == hi {
-        return sorted[lo];
-    }
-    let frac = rank - lo as f64;
-    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+/// Microseconds to milliseconds. RTTs are measured and stored in microseconds but
+/// every output (text and JSON) is in milliseconds, so this is the single conversion.
+fn us_to_ms(us: u64) -> f64 {
+    us as f64 / 1000.0
+}
+
+/// Highest RTT the histogram needs to track, in microseconds.
+///
+/// A single query is bounded by `--timeout` per attempt, `--attempts` attempts, and one
+/// such budget per nameserver (total timeout ≈ timeout * attempts * nameservers), and
+/// every bit of that is a legitimate RTT for a slow-but-successful answer. The bound is
+/// that worst case doubled, so real samples never sit at the ceiling; anything beyond it
+/// is clamped into the top bucket rather than dropped.
+fn max_trackable_rtt_us(timeout_ms: u64, attempts: usize, nameservers: usize) -> u64 {
+    timeout_ms
+        .max(1)
+        .saturating_mul(1_000)
+        .saturating_mul(attempts.max(1) as u64)
+        .saturating_mul(nameservers.max(1) as u64)
+        .saturating_mul(2)
 }
 
 /// Well-known private / reserved IPv4 and IPv6 ranges. Built once and reused.
@@ -362,82 +366,101 @@ fn stats_bucket(status: &str) -> &'static str {
 
 // ─── RTT / Query Statistics ─────────────────────────────────────────────────
 
-/// Tracks per-query RTT for min/avg/max/mdev calculation
+/// Lowest RTT the histogram can tell apart, in microseconds.
+const RTT_LOW_US: u64 = 1;
+/// Significant digits the histogram keeps (hdrhistogram allows 0..=5). Values below
+/// 2048 us are stored at full 1 us resolution; above that the error stays under 0.1%.
+const RTT_SIGFIG: u8 = 3;
+
+/// Tracks per-query RTT for min/avg/max/mdev and percentiles.
+///
+/// Samples are microseconds in an HDR histogram, so the cost is a fixed-size array
+/// rather than one f64 per query, and percentiles come straight out of it.
+///
+/// Only queries that actually got a response are recorded. A timeout never made a round
+/// trip -- its elapsed time is just the timeout budget being spent -- so recording it
+/// would drag avg/max/mdev and every percentile toward `--timeout`. Timeouts are counted
+/// and reported in the timeout status bucket instead; see `QueryStats::record_completion`.
 struct RttTracker {
-    count: u64,
-    min_ms: f64,
-    max_ms: f64,
-    sum_ms: f64,
-    sum_sq_ms: f64,
-    // Per-query samples, kept so we can compute exact percentiles at the end.
-    samples: Vec<f64>,
+    hist: Histogram<u64>,
 }
 
 impl RttTracker {
-    fn new() -> Self {
+    /// `max_us` is the largest RTT to track, in microseconds; see `max_trackable_rtt_us`.
+    fn new(max_us: u64) -> Self {
+        // hdrhistogram requires high >= 2 * low; max_trackable_rtt_us always satisfies
+        // that, but clamp so construction can never fail on a pathological value.
+        let high = max_us.max(RTT_LOW_US * 2);
         Self {
-            count: 0,
-            min_ms: f64::MAX,
-            max_ms: 0.0,
-            sum_ms: 0.0,
-            sum_sq_ms: 0.0,
-            samples: Vec::new(),
+            hist: Histogram::new_with_bounds(RTT_LOW_US, high, RTT_SIGFIG)
+                .expect("valid RTT histogram bounds"),
         }
     }
 
     fn record(&mut self, duration: Duration) {
-        let ms = duration.as_secs_f64() * 1000.0;
-        self.count += 1;
-        if ms < self.min_ms {
-            self.min_ms = ms;
-        }
-        if ms > self.max_ms {
-            self.max_ms = ms;
-        }
-        self.sum_ms += ms;
-        self.sum_sq_ms += ms * ms;
-        self.samples.push(ms);
+        // A cached or loopback answer can round down to 0 us; clamp to the lowest
+        // discernible value so the sample still counts. saturating_record clamps the
+        // other end, keeping an outlier beyond the bound in the histogram as the max
+        // rather than discarding it.
+        let us = (duration.as_micros() as u64).max(RTT_LOW_US);
+        self.hist.saturating_record(us);
+    }
+
+    /// Number of RTT samples, i.e. answered queries. Timeouts are not counted here.
+    fn count(&self) -> u64 {
+        self.hist.len()
+    }
+
+    fn min_ms(&self) -> f64 {
+        us_to_ms(self.hist.min())
+    }
+
+    fn max_ms(&self) -> f64 {
+        us_to_ms(self.hist.max())
     }
 
     fn avg_ms(&self) -> f64 {
-        if self.count == 0 {
+        if self.count() == 0 {
             return 0.0;
         }
-        self.sum_ms / self.count as f64
+        self.hist.mean() / 1000.0
     }
 
     /// Population standard deviation of RTT
     fn mdev_ms(&self) -> f64 {
-        if self.count == 0 {
+        if self.count() == 0 {
             return 0.0;
         }
-        let mean = self.avg_ms();
-        let variance = (self.sum_sq_ms / self.count as f64) - (mean * mean);
-        // Guard against tiny negative values from floating-point imprecision
-        if variance < 0.0 { 0.0 } else { variance.sqrt() }
+        self.hist.stdev() / 1000.0
     }
 
     fn format_rtt(&self) -> String {
-        if self.count == 0 {
+        if self.count() == 0 {
             return "-/-/-/- ms".to_string();
         }
+        // Three decimals of a millisecond is one microsecond, the resolution the
+        // histogram is configured for.
         format!(
-            "{:.1}/{:.1}/{:.1}/{:.1} ms",
-            self.min_ms,
+            "{:.3}/{:.3}/{:.3}/{:.3} ms",
+            self.min_ms(),
             self.avg_ms(),
-            self.max_ms,
+            self.max_ms(),
             self.mdev_ms()
         )
     }
 
-    /// Exact (p50, p95, p99) latency percentiles in milliseconds.
+    /// (p50, p95, p99) latency percentiles in milliseconds, over answered queries only.
+    /// These are recorded values rather than interpolated ones, accurate to the
+    /// histogram's configured resolution.
     fn percentiles(&self) -> (f64, f64, f64) {
-        if self.samples.is_empty() {
+        if self.hist.is_empty() {
             return (0.0, 0.0, 0.0);
         }
-        let mut sorted = self.samples.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        (percentile(&sorted, 50.0), percentile(&sorted, 95.0), percentile(&sorted, 99.0))
+        (
+            us_to_ms(self.hist.value_at_quantile(0.50)),
+            us_to_ms(self.hist.value_at_quantile(0.95)),
+            us_to_ms(self.hist.value_at_quantile(0.99)),
+        )
     }
 }
 
@@ -464,7 +487,8 @@ struct QueryStats {
 }
 
 impl QueryStats {
-    fn new(expected_total: Option<u64>) -> Self {
+    /// `max_rtt_us` sizes the RTT histogram; see `max_trackable_rtt_us`.
+    fn new(expected_total: Option<u64>, max_rtt_us: u64) -> Self {
         Self {
             submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
@@ -472,7 +496,7 @@ impl QueryStats {
             eof_reached: AtomicBool::new(false),
             expected_total,
             start: Instant::now(),
-            rtt: Mutex::new(RttTracker::new()),
+            rtt: Mutex::new(RttTracker::new(max_rtt_us)),
             status_success: AtomicU64::new(0),
             status_ptrmatch: AtomicU64::new(0),
             status_nxdomain: AtomicU64::new(0),
@@ -484,7 +508,12 @@ impl QueryStats {
         }
     }
 
-    fn record_completion(&self, status: &str, duration: Duration) {
+    /// Count a finished query. `rtt` is the measured round-trip time, or None when the
+    /// query never got a response (a timeout). A timeout still lands in the timeout
+    /// status bucket and the error count, but its elapsed time is the timeout budget
+    /// rather than a round trip, so it is deliberately kept out of the RTT histogram
+    /// and every percentile derived from it.
+    fn record_completion(&self, status: &str, rtt: Option<Duration>) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         let bucket = stats_bucket(status);
         // NXDOMAIN and NODATA are definitive negative answers, not transient errors,
@@ -494,9 +523,10 @@ impl QueryStats {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
         self.bump_status(bucket);
-        if let Ok(mut rtt) = self.rtt.lock() {
-            rtt.record(duration);
-        }
+        if let Some(duration) = rtt
+            && let Ok(mut tracker) = self.rtt.lock() {
+                tracker.record(duration);
+            }
     }
 
     /// Increment the counter for a given status bucket name.
@@ -581,12 +611,12 @@ impl QueryStats {
         let succeeded = self.succeeded();
         let elapsed = self.start.elapsed();
 
-        // Compute the RTT string and percentiles under a single lock
-        let (rtt_str, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock() {
+        // Compute the RTT string, sample count and percentiles under a single lock
+        let (rtt_str, rtt_samples, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock() {
             let (p50, p95, p99) = rtt.percentiles();
-            (rtt.format_rtt(), p50, p95, p99)
+            (rtt.format_rtt(), rtt.count(), p50, p95, p99)
         } else {
-            ("-/-/-/- ms".to_string(), 0.0, 0.0, 0.0)
+            ("-/-/-/- ms".to_string(), 0, 0.0, 0.0, 0.0)
         };
 
         let status_str = {
@@ -602,8 +632,8 @@ impl QueryStats {
              Errors:    {}\n\
              Elapsed:   {:.1}s\n\
              QPS:       {:.1} q/s\n\
-             RTT:       {} (min/avg/max/mdev)\n\
-             Pctl:      {:.1}/{:.1}/{:.1} ms (p50/p95/p99)\n\
+             RTT:       {} (min/avg/max/mdev over {} answered, timeouts excluded)\n\
+             Pctl:      {:.3}/{:.3}/{:.3} ms (p50/p95/p99)\n\
              Status:    {}",
             completed,
             succeeded,
@@ -611,6 +641,7 @@ impl QueryStats {
             elapsed.as_secs_f64(),
             self.qps(),
             rtt_str,
+            rtt_samples,
             p50,
             p95,
             p99,
@@ -626,17 +657,26 @@ impl QueryStats {
         let succeeded = self.succeeded();
         let elapsed = self.start.elapsed().as_secs_f64();
 
-        let (rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock()
-        {
-            if rtt.count > 0 {
-                let (p50, p95, p99) = rtt.percentiles();
-                (rtt.min_ms, rtt.avg_ms(), rtt.max_ms, rtt.mdev_ms(), p50, p95, p99)
+        let (rtt_samples, rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p95, p99) =
+            if let Ok(rtt) = self.rtt.lock() {
+                if rtt.count() > 0 {
+                    let (p50, p95, p99) = rtt.percentiles();
+                    (
+                        rtt.count(),
+                        rtt.min_ms(),
+                        rtt.avg_ms(),
+                        rtt.max_ms(),
+                        rtt.mdev_ms(),
+                        p50,
+                        p95,
+                        p99,
+                    )
+                } else {
+                    (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                }
             } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            }
-        } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        };
+                (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            };
 
         // Round helper: keep 3 decimals of a millisecond
         let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
@@ -652,6 +692,8 @@ impl QueryStats {
             "errors": errors,
             "elapsed_sec": r3(elapsed),
             "qps": (self.qps() * 10.0).round() / 10.0,
+            // RTT figures cover answered queries only; timeouts are in status_counts
+            "rtt_samples": rtt_samples,
             "rtt_ms_min": r3(rtt_min),
             "rtt_ms_avg": r3(rtt_avg),
             "rtt_ms_max": r3(rtt_max),
@@ -726,6 +768,11 @@ struct LookupResult {
     query_type: String,
     #[serde(skip_serializing)]
     is_success: bool,
+    // True when the query never got a response at all -- the case `classify_resolve_error`
+    // labels "TIMEOUT". It is still counted and reported as a timeout, but its elapsed
+    // time is the timeout budget rather than a round trip, so the RTT statistics skip it.
+    #[serde(skip_serializing)]
+    timed_out: bool,
     status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     records: Vec<RecordEntry>,
@@ -1061,6 +1108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.edns0 = true;
     opts.try_tcp_on_error = true;
 
+    // Size the RTT histogram from the settings that bound a single query. Read here
+    // because building the resolver consumes `config`.
+    let max_rtt_us = max_trackable_rtt_us(args.timeout, args.attempts, config.name_servers().len());
+
     let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
         .with_options(opts)
         .build()?;
@@ -1154,7 +1205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Initialize statistics tracking (used by --progress and --stats)
-    let stats = Arc::new(QueryStats::new(expected_total));
+    let stats = Arc::new(QueryStats::new(expected_total, max_rtt_us));
 
     // Initialize progress bar (if --progress). The bar tracks completed queries. When the
     // total is known upfront (regular -i file or -- args only) the length is exact and
@@ -1275,7 +1326,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // (i.e. the name had non-ASCII labels); omitted for plain ASCII names.
             result.punycode = punycode_if_different(&result.query);
 
-            stats.record_completion(&result.status, elapsed);
+            // A timed-out query never completed a round trip, so `elapsed` is just the
+            // timeout budget: pass None and let it be counted purely as a timeout.
+            let rtt = (!result.timed_out).then_some(elapsed);
+            stats.record_completion(&result.status, rtt);
             if let Some(ref pb) = pb {
                 // With an exact pre-counted total the bar length is fixed at creation;
                 // otherwise (pipe/stdin) it grows with submissions and the bar shows
@@ -1393,6 +1447,13 @@ fn classify_resolve_error(e: &NetError) -> String {
     }
 }
 
+/// True when a resolve error means no response ever arrived, so there is no round trip
+/// to measure. This is the same condition `classify_resolve_error` reports as "TIMEOUT",
+/// exposed as a flag so the RTT statistics can skip these without matching on strings.
+fn is_timeout_error(e: &NetError) -> bool {
+    matches!(e, NetError::Timeout)
+}
+
 /// Helper: build an error LookupResult
 fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
     LookupResult {
@@ -1400,6 +1461,7 @@ fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
         punycode: None,
         query_type: qt_lower,
         is_success: false,
+        timed_out: is_timeout_error(e),
         status: classify_resolve_error(e), // Now consumes the generated String
         records: vec![],
         ttl: None,
@@ -1418,6 +1480,8 @@ fn lookup_success(
         punycode: None,
         query_type: qt_lower,
         is_success: !records.is_empty(),
+        // A result only exists here because a response came back, so it was measured.
+        timed_out: false,
         status: if records.is_empty() {
             "No records found".to_string()
         } else {
@@ -1726,6 +1790,7 @@ mod tests {
             punycode: None,
             query_type: qt_lower.to_string(),
             is_success: !records.is_empty(),
+            timed_out: false,
             status: if records.is_empty() {
                 "No records found".to_string()
             } else {
@@ -1807,27 +1872,66 @@ mod tests {
     }
 
     // ── percentiles / RTT ────────────────────────────────────────────────────
+    /// A tracker sized like a default run: 2000 ms timeout, 2 attempts, 1 nameserver.
+    fn test_rtt_tracker() -> RttTracker {
+        RttTracker::new(max_trackable_rtt_us(2000, 2, 1))
+    }
+
     #[test]
-    fn percentile_math() {
-        let v: Vec<f64> = (1..=100).map(|x| x as f64).collect();
-        assert!((percentile(&v, 50.0) - 50.5).abs() < 1e-9);
-        assert!((percentile(&v, 95.0) - 95.05).abs() < 1e-9);
-        assert!((percentile(&v, 99.0) - 99.01).abs() < 1e-9);
-        assert_eq!(percentile(&[], 50.0), 0.0);
-        assert_eq!(percentile(&[7.0], 99.0), 7.0);
+    fn rtt_bound_covers_worst_case_query() {
+        // timeout * attempts * nameservers, in us, doubled
+        assert_eq!(max_trackable_rtt_us(2000, 2, 1), 8_000_000);
+        assert_eq!(max_trackable_rtt_us(2000, 2, 3), 24_000_000);
+        assert_eq!(max_trackable_rtt_us(1, 1, 1), 2_000);
+        // degenerate inputs still produce a usable (high >= 2 * low) bound
+        assert!(max_trackable_rtt_us(0, 0, 0) >= 2);
+        assert!(max_trackable_rtt_us(u64::MAX, 4, 4) > 0);
     }
 
     #[test]
     fn rtt_tracker_percentiles() {
-        let mut t = RttTracker::new();
+        let mut t = test_rtt_tracker();
         for ms in 1..=100u64 {
             t.record(Duration::from_millis(ms));
         }
+        assert_eq!(t.count(), 100);
+        // The histogram reports recorded values rather than interpolating between them,
+        // so these land on the sample itself, within the configured resolution.
         let (p50, p95, p99) = t.percentiles();
-        assert!((p50 - 50.5).abs() < 1e-6);
-        assert!((p95 - 95.05).abs() < 1e-6);
-        assert!((p99 - 99.01).abs() < 1e-6);
-        assert_eq!(RttTracker::new().percentiles(), (0.0, 0.0, 0.0));
+        assert!((p50 - 50.0).abs() < 0.1, "p50 was {}", p50);
+        assert!((p95 - 95.0).abs() < 0.1, "p95 was {}", p95);
+        assert!((p99 - 99.0).abs() < 0.1, "p99 was {}", p99);
+        assert!((t.min_ms() - 1.0).abs() < 0.01, "min was {}", t.min_ms());
+        assert!((t.max_ms() - 100.0).abs() < 0.1, "max was {}", t.max_ms());
+        assert!((t.avg_ms() - 50.5).abs() < 0.1, "avg was {}", t.avg_ms());
+        assert_eq!(test_rtt_tracker().percentiles(), (0.0, 0.0, 0.0));
+        assert_eq!(test_rtt_tracker().format_rtt(), "-/-/-/- ms");
+    }
+
+    #[test]
+    fn rtt_tracker_microsecond_resolution() {
+        let mut t = test_rtt_tracker();
+        // Sub-millisecond RTTs must not collapse to 0: below 2048 us the histogram
+        // stores single microseconds.
+        t.record(Duration::from_micros(250));
+        t.record(Duration::from_micros(251));
+        assert_eq!(t.count(), 2);
+        assert!((t.min_ms() - 0.250).abs() < 0.0005, "min was {}", t.min_ms());
+        assert!((t.max_ms() - 0.251).abs() < 0.0005, "max was {}", t.max_ms());
+        // A zero-duration sample is clamped in, not dropped
+        let mut z = test_rtt_tracker();
+        z.record(Duration::from_micros(0));
+        assert_eq!(z.count(), 1);
+    }
+
+    #[test]
+    fn rtt_tracker_clamps_outliers() {
+        let mut t = RttTracker::new(max_trackable_rtt_us(10, 1, 1)); // 20 ms ceiling
+        t.record(Duration::from_millis(5));
+        t.record(Duration::from_secs(60)); // far beyond the bound
+        // The outlier is kept as the max rather than discarded or panicking
+        assert_eq!(t.count(), 2);
+        assert!(t.max_ms() >= 20.0, "max was {}", t.max_ms());
     }
 
     #[test]
@@ -1842,10 +1946,10 @@ mod tests {
 
     #[test]
     fn query_stats_counts_and_json() {
-        let s = QueryStats::new(None);
-        s.record_completion("SUCCESS", Duration::from_millis(10));
-        s.record_completion("NXDOMAIN", Duration::from_millis(20));
-        s.record_completion("TIMEOUT", Duration::from_millis(30));
+        let s = QueryStats::new(None, max_trackable_rtt_us(2000, 2, 1));
+        s.record_completion("SUCCESS", Some(Duration::from_millis(10)));
+        s.record_completion("NXDOMAIN", Some(Duration::from_millis(20)));
+        s.record_completion("TIMEOUT", None);
         let counts = s.status_counts();
         assert!(counts.contains(&("success", 1)));
         assert!(counts.contains(&("nxdomain", 1)));
@@ -1855,6 +1959,33 @@ mod tests {
         assert_eq!(v["succeeded"], 1); // only SUCCESS
         assert_eq!(v["errors"], 1); // only TIMEOUT; NXDOMAIN is a definitive answer, not an error
         assert!(v["status_counts"]["success"] == 1);
+    }
+
+    #[test]
+    fn timeouts_are_reported_but_not_measured() {
+        let s = QueryStats::new(None, max_trackable_rtt_us(2000, 2, 1));
+        s.record_completion("SUCCESS", Some(Duration::from_millis(10)));
+        s.record_completion("TIMEOUT", None);
+        s.record_completion("TIMEOUT", None);
+        let v = s.stats_value();
+        // Both timeouts are counted and reported as timeouts...
+        assert_eq!(v["queries"], 3);
+        assert_eq!(v["status_counts"]["timeout"], 2);
+        assert_eq!(v["errors"], 2);
+        // ...but only the answered query contributes to the RTT figures, so the
+        // 2000 ms timeout budget never shows up as latency.
+        assert_eq!(v["rtt_samples"], 1);
+        let max = v["rtt_ms_max"].as_f64().unwrap();
+        let p99 = v["rtt_ms_p99"].as_f64().unwrap();
+        assert!((max - 10.0).abs() < 0.1, "max was {}", max);
+        assert!((p99 - 10.0).abs() < 0.1, "p99 was {}", p99);
+    }
+
+    #[test]
+    fn timeout_errors_are_flagged() {
+        assert!(is_timeout_error(&NetError::Timeout));
+        // A result built from a successful lookup is never treated as a timeout
+        assert!(!mk_result("example.com", "a", &["1.2.3.4"]).timed_out);
     }
 
     // ── reserved IPs ─────────────────────────────────────────────────────────
