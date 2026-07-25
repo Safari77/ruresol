@@ -7,7 +7,7 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::{Name, RData, RecordType};
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
@@ -326,8 +326,12 @@ fn find_wildcard_parent<'a>(
     let mut best: Option<(&str, &HashSet<IpAddr>)> = None;
     for (parent, set) in wildcards {
         // exact match or a strict subdomain (the leading dot avoids "notexample.com"
-        // matching parent "example.com")
-        let matches = host == parent || host.ends_with(&format!(".{}", parent));
+        // matching parent "example.com"). Checked without building a ".parent" String,
+        // since this runs once per parent for every single result.
+        let matches = host == parent
+            || (host.len() > parent.len()
+                && host.ends_with(parent.as_str())
+                && host.as_bytes()[host.len() - parent.len() - 1] == b'.');
         if matches && best.is_none_or(|(bp, _)| parent.len() > bp.len()) {
             best = Some((parent.as_str(), set));
         }
@@ -685,6 +689,30 @@ impl RecordEntry {
     }
 }
 
+/// Turn an answer section into output records plus the TTL to report.
+///
+/// `f` decides which answers are results (returning None for the rest). Filtering
+/// matters because the answer section also carries the CNAME chain that led to the
+/// answer: those records are not results of the query, and their TTL — usually
+/// different from the answer's — must not be reported as the record's TTL. The TTL
+/// is the smallest one among the records that `f` kept, or None when `include_ttl`
+/// is false or nothing matched.
+fn collect_records<'a, I, F>(answers: I, include_ttl: bool, f: F) -> (Vec<RecordEntry>, Option<u32>)
+where
+    I: IntoIterator<Item = &'a Record>,
+    F: Fn(&RData) -> Option<RecordEntry>,
+{
+    let mut records = Vec::new();
+    let mut ttl: Option<u32> = None;
+    for r in answers {
+        if let Some(entry) = f(&r.data) {
+            records.push(entry);
+            ttl = Some(ttl.map_or(r.ttl, |t| t.min(r.ttl)));
+        }
+    }
+    (records, if include_ttl { ttl } else { None })
+}
+
 /// Unified structure for handling outputs
 #[derive(serde::Serialize, Clone)]
 struct LookupResult {
@@ -932,7 +960,11 @@ async fn count_input_lines(path: &str) -> Option<u64> {
     let mut reader = BufReader::new(file);
     let mut buf = Vec::new();
     let mut count: u64 = 0;
-    while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf).await {
+    loop {
+        // A read error must not be reported as an exact count: returning None makes the
+        // progress bar fall back to the dynamic total instead of pinning it to a
+        // silently truncated one.
+        let bytes_read = reader.read_until(b'\n', &mut buf).await.ok()?;
         if bytes_read == 0 {
             break; // EOF
         }
@@ -980,6 +1012,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("error: --rate-limit must be at least 1 (queries per second)");
         std::process::exit(1);
     }
+    if args.timeout == 0 {
+        eprintln!("error: --timeout must be at least 1 (milliseconds)");
+        std::process::exit(1);
+    }
+    if args.attempts == 0 {
+        eprintln!("error: --attempts must be at least 1");
+        std::process::exit(1);
+    }
 
     // NOTE: The custom (`-R`) and DoH branches below use ResolverOpts::default(), while
     // the system branch keeps whatever read_system_conf() returns. As a result, search
@@ -996,11 +1036,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Accept either "IP" (port 53) or "IP:PORT"
             let (ip, port): (IpAddr, u16) = if let Ok(ip) = r.parse::<IpAddr>() {
                 (ip, 53)
-            } else {
-                let sa: SocketAddr = r.parse().unwrap_or_else(|_| {
-                    panic!("Invalid resolver format: {}. Use IP or IP:PORT", r)
-                });
+            } else if let Ok(sa) = r.parse::<SocketAddr>() {
                 (sa.ip(), sa.port())
+            } else {
+                eprintln!("error: invalid resolver '{}'. Use IP or IP:PORT (IPv6: [::1]:5353)", r);
+                std::process::exit(1);
             };
             // Build UDP + TCP connections with the (possibly non-default) port
             let mut udp = ConnectionConfig::new(ProtocolConfig::Udp);
@@ -1147,11 +1187,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Then read from file/stdin (if available)
         if let Some(ref mut reader) = reader {
             let mut buf = Vec::new();
-            while let Ok(bytes_read) = reader.read_until(b'\n', &mut buf).await {
-                if bytes_read == 0 {
-                    stats_stream.eof_reached.store(true, Ordering::Relaxed);
-                    break;
-                } // EOF
+            loop {
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Don't stop silently: a truncated run would otherwise be
+                        // indistinguishable from a complete one.
+                        eprintln!("error reading input: {}", e);
+                        break;
+                    }
+                }
 
                 // Check if valid UTF-8. If valid, process. If not, we basically ignore (skip) it.
                 if let Ok(line_str) = std::str::from_utf8(&buf) {
@@ -1164,10 +1210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // If no reader, mark EOF immediately (only -- args)
-        if reader.is_none() {
-            stats_stream.eof_reached.store(true, Ordering::Relaxed);
-        }
+        // Input is exhausted: EOF, a read error, or no reader at all (only -- args).
+        // Marking it in every case keeps the progress total from being stuck at "?".
+        stats_stream.eof_reached.store(true, Ordering::Relaxed);
     };
 
     let effective_types = Arc::new(effective_types);
@@ -1308,11 +1353,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "]\n".to_string()
         };
-        let _ = write!(std::io::stdout().lock(), "{}", suffix);
+        // A dropped write here silently truncates the JSON document while still exiting
+        // 0, so it goes through the same error handling as the result lines.
+        handle_write(write!(std::io::stdout().lock(), "{}", suffix));
     } else if args.stats {
         if args.json {
             use std::io::Write;
-            let _ = writeln!(std::io::stdout().lock(), "{}", stats.format_summary_json());
+            handle_write(writeln!(std::io::stdout().lock(), "{}", stats.format_summary_json()));
         } else {
             eprintln!("{}", stats.format_summary());
         }
@@ -1445,95 +1492,66 @@ async fn typed_lookup(
     match query_type {
         "A" => match resolver.ipv4_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::A(a) => Some(RecordEntry::Simple(a.0.to_string())),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "AAAA" => match resolver.ipv6_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::AAAA(a) => Some(RecordEntry::Simple(a.0.to_string())),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "MX" => match resolver.mx_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::MX(mx) => Some(RecordEntry::WithPriority {
                             priority: mx.preference,
                             value: mx.exchange.to_string(),
                         }),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "NS" => match resolver.ns_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::NS(ns) => Some(RecordEntry::Simple(ns.0.to_string())),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "TXT" => match resolver.txt_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::TXT(txt) => Some(RecordEntry::Simple(txt.to_string())),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "SOA" => match resolver.soa_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::SOA(soa) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {} {} {} {}",
                             soa.mname,
@@ -1545,27 +1563,21 @@ async fn typed_lookup(
                             soa.minimum
                         ))),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "SRV" => match resolver.srv_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let ttl =
-                    include_ttl.then(|| lookup.answers().iter().map(|r| r.ttl).min()).flatten();
-                let records: Vec<RecordEntry> = lookup
-                    .answers()
-                    .iter()
-                    .filter_map(|r| match &r.data {
+                let (records, ttl) =
+                    collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::SRV(srv) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {}",
                             srv.priority, srv.weight, srv.port, srv.target
                         ))),
                         _ => None,
-                    })
-                    .collect();
+                    });
                 lookup_success(input, qt_lower, records, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
@@ -1579,14 +1591,12 @@ async fn typed_lookup(
                 let rev_name = hickory_resolver::proto::rr::Name::from(ip);
                 match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
-                        let records: Vec<RecordEntry> = lookup
-                            .answers()
-                            .iter()
-                            .filter_map(|r| match &r.data {
+                        // --ttl applies to reverse lookups too; it used to be dropped here.
+                        let (records, ttl) =
+                            collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                                 RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
                                 _ => None,
-                            })
-                            .collect();
+                            });
 
                         // Forward-confirm: resolve A (IPv4) or AAAA (IPv6) for each PTR name
                         let mut any_match = false;
@@ -1623,7 +1633,7 @@ async fn typed_lookup(
                         }
 
                         let label = if any_match { "ptrmatch" } else { "ptr" };
-                        let mut result = lookup_success(input, label.to_string(), records, None);
+                        let mut result = lookup_success(input, label.to_string(), records, ttl);
                         if any_match {
                             result.status = "PTRMATCH".to_string();
                         }
@@ -1635,16 +1645,11 @@ async fn typed_lookup(
                 // Not an IP — do a generic PTR lookup (no forward-confirm possible)
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
-                        let ttl = if include_ttl {
-                            lookup.answers().iter().map(|r| r.ttl).min()
-                        } else {
-                            None
-                        };
-                        let records: Vec<RecordEntry> = lookup
-                            .answers()
-                            .iter()
-                            .map(|r| RecordEntry::Simple(r.data.to_string()))
-                            .collect();
+                        let (records, ttl) =
+                            collect_records(lookup.answers().iter(), include_ttl, |d| {
+                                (d.record_type() == RecordType::PTR)
+                                    .then(|| RecordEntry::Simple(d.to_string()))
+                            });
                         lookup_success(input, "ptr".to_string(), records, ttl)
                     }
                     Err(e) => lookup_error(input, "ptr".to_string(), &e),
@@ -1657,15 +1662,13 @@ async fn typed_lookup(
                 let rev_name = hickory_resolver::proto::rr::Name::from(ip);
                 match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
-                        let records: Vec<RecordEntry> = lookup
-                            .answers()
-                            .iter()
-                            .filter_map(|r| match &r.data {
+                        // --ttl applies to reverse lookups too; it used to be dropped here.
+                        let (records, ttl) =
+                            collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                                 RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
                                 _ => None,
-                            })
-                            .collect();
-                        lookup_success(input, qt_lower, records, None)
+                            });
+                        lookup_success(input, qt_lower, records, ttl)
                     }
                     Err(e) => lookup_error(input, qt_lower, &e),
                 }
@@ -1673,16 +1676,11 @@ async fn typed_lookup(
                 // Not an IP — do a generic PTR lookup on the hostname
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
-                        let ttl = if include_ttl {
-                            lookup.answers().iter().map(|r| r.ttl).min()
-                        } else {
-                            None
-                        };
-                        let records: Vec<RecordEntry> = lookup
-                            .answers()
-                            .iter()
-                            .map(|r| RecordEntry::Simple(r.data.to_string()))
-                            .collect();
+                        let (records, ttl) =
+                            collect_records(lookup.answers().iter(), include_ttl, |d| {
+                                (d.record_type() == RecordType::PTR)
+                                    .then(|| RecordEntry::Simple(d.to_string()))
+                            });
                         lookup_success(input, qt_lower, records, ttl)
                     }
                     Err(e) => lookup_error(input, qt_lower, &e),
@@ -1690,21 +1688,16 @@ async fn typed_lookup(
             }
         }
         // Generic lookup for CAA, DNSKEY, DS, HTTPS, TLSA
-        // resolver.lookup() returns Lookup directly, so we extract TTL inline
+        // resolver.lookup() returns Lookup directly, so records and TTL are extracted inline
         _ => {
             let record_type = to_record_type(query_type);
             match resolver.lookup(input.as_str(), record_type).await {
                 Ok(lookup) => {
-                    let ttl = if include_ttl {
-                        lookup.answers().iter().map(|r| r.ttl).min()
-                    } else {
-                        None
-                    };
-                    let records: Vec<RecordEntry> = lookup
-                        .answers()
-                        .iter()
-                        .map(|r| RecordEntry::Simple(r.data.to_string()))
-                        .collect();
+                    let (records, ttl) =
+                        collect_records(lookup.answers().iter(), include_ttl, |d| {
+                            (d.record_type() == record_type)
+                                .then(|| RecordEntry::Simple(d.to_string()))
+                        });
                     lookup_success(input, qt_lower, records, ttl)
                 }
                 Err(e) => lookup_error(input, qt_lower, &e),
@@ -1970,6 +1963,11 @@ mod tests {
         assert!(find_wildcard_parent("example.com", &m).is_some());
         assert!(find_wildcard_parent("notexample.com", &m).is_none());
         assert!(find_wildcard_parent("other.org", &m).is_none());
+        // shorter than the parent, and a suffix that isn't on a label boundary
+        assert!(find_wildcard_parent("com", &m).is_none());
+        assert!(find_wildcard_parent("xexample.com", &m).is_none());
+        // the longest matching parent wins regardless of HashMap iteration order
+        assert!(find_wildcard_parent("a.b.sub.example.com", &m).unwrap().contains(&ip("5.6.7.8")));
     }
 
     #[test]
