@@ -524,9 +524,10 @@ impl QueryStats {
         }
         self.bump_status(bucket);
         if let Some(duration) = rtt
-            && let Ok(mut tracker) = self.rtt.lock() {
-                tracker.record(duration);
-            }
+            && let Ok(mut tracker) = self.rtt.lock()
+        {
+            tracker.record(duration);
+        }
     }
 
     /// Increment the counter for a given status bucket name.
@@ -998,6 +999,13 @@ fn handle_write(res: std::io::Result<()>) {
     }
 }
 
+/// Normalize one input line: strip whitespace and a UTF-8 BOM, drop empty
+/// lines and '#' comments. Returns None when the line carries no query.
+fn clean_input_line(line: &str) -> Option<&str> {
+    let t = line.trim().trim_start_matches('\u{feff}').trim();
+    if t.is_empty() || t.starts_with('#') { None } else { Some(t) }
+}
+
 /// Pre-scan a regular input file and count the lines that will actually be queried,
 /// applying the same filter as the input stream (valid UTF-8, trimmed non-empty, not a
 /// '#' comment). Returns None if the file can't be opened. Only called for regular
@@ -1016,8 +1024,7 @@ async fn count_input_lines(path: &str) -> Option<u64> {
             break; // EOF
         }
         if let Ok(line_str) = std::str::from_utf8(&buf) {
-            let trimmed = line_str.trim();
-            if !trimmed.starts_with('#') && !trimmed.is_empty() {
+            if clean_input_line(line_str).is_some() {
                 count += 1;
             }
         }
@@ -1252,9 +1259,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Check if valid UTF-8. If valid, process. If not, we basically ignore (skip) it.
                 if let Ok(line_str) = std::str::from_utf8(&buf) {
-                    let trimmed = line_str.trim().to_string();
-                    if !trimmed.starts_with('#') && !trimmed.is_empty() {
-                        yield trimmed;
+                    if let Some(line) = clean_input_line(line_str) {
+                        yield line.to_string();
                     }
                 }
                 buf.clear();
@@ -1807,6 +1813,14 @@ mod tests {
         assert_eq!(parse_query_type("a").unwrap(), "A");
         assert_eq!(parse_query_type("AaAa").unwrap(), "AAAA");
         assert!(parse_query_type("bogus").is_err());
+    }
+
+    #[test]
+    fn input_line_cleaning() {
+        assert_eq!(clean_input_line("  example.com  "), Some("example.com"));
+        assert_eq!(clean_input_line("\u{feff}example.com"), Some("example.com"));
+        assert_eq!(clean_input_line("# comment"), None);
+        assert_eq!(clean_input_line("   "), None);
     }
 
     #[test]
