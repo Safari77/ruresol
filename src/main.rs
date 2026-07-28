@@ -774,6 +774,11 @@ struct LookupResult {
     // time is the timeout budget rather than a round trip, so the RTT statistics skip it.
     #[serde(skip_serializing)]
     timed_out: bool,
+    /// RTT measured inside the lookup when the operation performs more than the
+    /// one round trip the caller times (PTRMATCH = reverse + forward confirms).
+    /// When set, the stats record this instead of the whole operation's elapsed.
+    #[serde(skip_serializing)]
+    measured_rtt: Option<Duration>,
     status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     records: Vec<RecordEntry>,
@@ -1339,7 +1344,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // A timed-out query never completed a round trip, so `elapsed` is just the
             // timeout budget: pass None and let it be counted purely as a timeout.
-            let rtt = (!result.timed_out).then_some(elapsed);
+            // For multi-round-trip lookups (PTRMATCH), prefer the primary lookup's RTT
+            // so forward-confirmation queries don't skew the latency statistics.
+            let rtt = if result.timed_out { None } else { result.measured_rtt.or(Some(elapsed)) };
             stats.record_completion(&result.status, rtt);
             if let Some(ref pb) = pb {
                 // With an exact pre-counted total the bar length is fixed at creation;
@@ -1473,6 +1480,7 @@ fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
         query_type: qt_lower,
         is_success: false,
         timed_out: is_timeout_error(e),
+        measured_rtt: None,
         status: classify_resolve_error(e), // Now consumes the generated String
         records: vec![],
         ttl: None,
@@ -1493,6 +1501,7 @@ fn lookup_success(
         is_success: !records.is_empty(),
         // A result only exists here because a response came back, so it was measured.
         timed_out: false,
+        measured_rtt: None,
         status: if records.is_empty() {
             "No records found".to_string()
         } else {
@@ -1664,8 +1673,10 @@ async fn typed_lookup(
             if let Ok(ip) = input.parse::<IpAddr>() {
                 // reverse_lookup takes impl IntoName; convert IP → reverse DNS Name
                 let rev_name = hickory_resolver::proto::rr::Name::from(ip);
+                let rev_start = Instant::now();
                 match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
+                        let rev_elapsed = rev_start.elapsed();
                         // --ttl applies to reverse lookups too; it used to be dropped here.
                         let (records, ttl) =
                             collect_records(lookup.answers().iter(), include_ttl, |d| match d {
@@ -1712,6 +1723,7 @@ async fn typed_lookup(
                         if any_match {
                             result.status = "PTRMATCH".to_string();
                         }
+                        result.measured_rtt = Some(rev_elapsed);
                         result
                     }
                     Err(e) => lookup_error(input, "ptr".to_string(), &e),
@@ -1802,6 +1814,7 @@ mod tests {
             query_type: qt_lower.to_string(),
             is_success: !records.is_empty(),
             timed_out: false,
+            measured_rtt: None,
             status: if records.is_empty() {
                 "No records found".to_string()
             } else {
