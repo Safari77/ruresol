@@ -452,12 +452,13 @@ impl RttTracker {
     /// (p50, p95, p99) latency percentiles in milliseconds, over answered queries only.
     /// These are recorded values rather than interpolated ones, accurate to the
     /// histogram's configured resolution.
-    fn percentiles(&self) -> (f64, f64, f64) {
+    fn percentiles(&self) -> (f64, f64, f64, f64) {
         if self.hist.is_empty() {
-            return (0.0, 0.0, 0.0);
+            return (0.0, 0.0, 0.0, 0.0);
         }
         (
             us_to_ms(self.hist.value_at_quantile(0.50)),
+            us_to_ms(self.hist.value_at_quantile(0.90)),
             us_to_ms(self.hist.value_at_quantile(0.95)),
             us_to_ms(self.hist.value_at_quantile(0.99)),
         )
@@ -613,11 +614,11 @@ impl QueryStats {
         let elapsed = self.start.elapsed();
 
         // Compute the RTT string, sample count and percentiles under a single lock
-        let (rtt_str, rtt_samples, p50, p95, p99) = if let Ok(rtt) = self.rtt.lock() {
-            let (p50, p95, p99) = rtt.percentiles();
-            (rtt.format_rtt(), rtt.count(), p50, p95, p99)
+        let (rtt_str, rtt_samples, p50, p90, p95, p99) = if let Ok(rtt) = self.rtt.lock() {
+            let (p50, p90, p95, p99) = rtt.percentiles();
+            (rtt.format_rtt(), rtt.count(), p50, p90, p95, p99)
         } else {
-            ("-/-/-/- ms".to_string(), 0, 0.0, 0.0, 0.0)
+            ("-/-/-/- ms".to_string(), 0, 0.0, 0.0, 0.0, 0.0)
         };
 
         let status_str = {
@@ -634,7 +635,7 @@ impl QueryStats {
              Elapsed:   {:.1}s\n\
              QPS:       {:.1} q/s\n\
              RTT:       {} (min/avg/max/mdev over {} answered, timeouts excluded)\n\
-             Pctl:      {:.3}/{:.3}/{:.3} ms (p50/p95/p99)\n\
+             Pctl:      {:.3}/{:.3}/{:.3}/{:.3} ms (p50/p90/p95/p99)\n\
              Status:    {}",
             completed,
             succeeded,
@@ -644,6 +645,7 @@ impl QueryStats {
             rtt_str,
             rtt_samples,
             p50,
+            p90,
             p95,
             p99,
             status_str
@@ -658,10 +660,10 @@ impl QueryStats {
         let succeeded = self.succeeded();
         let elapsed = self.start.elapsed().as_secs_f64();
 
-        let (rtt_samples, rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p95, p99) =
+        let (rtt_samples, rtt_min, rtt_avg, rtt_max, rtt_mdev, p50, p90, p95, p99) =
             if let Ok(rtt) = self.rtt.lock() {
                 if rtt.count() > 0 {
-                    let (p50, p95, p99) = rtt.percentiles();
+                    let (p50, p90, p95, p99) = rtt.percentiles();
                     (
                         rtt.count(),
                         rtt.min_ms(),
@@ -669,14 +671,15 @@ impl QueryStats {
                         rtt.max_ms(),
                         rtt.mdev_ms(),
                         p50,
+                        p90,
                         p95,
                         p99,
                     )
                 } else {
-                    (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                 }
             } else {
-                (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                (0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             };
 
         // Round helper: keep 3 decimals of a millisecond
@@ -700,6 +703,7 @@ impl QueryStats {
             "rtt_ms_max": r3(rtt_max),
             "rtt_ms_mdev": r3(rtt_mdev),
             "rtt_ms_p50": r3(p50),
+            "rtt_ms_p90": r3(p90),
             "rtt_ms_p95": r3(p95),
             "rtt_ms_p99": r3(p99),
             "status_counts": serde_json::Value::Object(status_counts)
@@ -1929,14 +1933,15 @@ mod tests {
         assert_eq!(t.count(), 100);
         // The histogram reports recorded values rather than interpolating between them,
         // so these land on the sample itself, within the configured resolution.
-        let (p50, p95, p99) = t.percentiles();
+        let (p50, p90, p95, p99) = t.percentiles();
         assert!((p50 - 50.0).abs() < 0.1, "p50 was {}", p50);
+        assert!((p90 - 90.0).abs() < 0.1, "p90 was {}", p90);
         assert!((p95 - 95.0).abs() < 0.1, "p95 was {}", p95);
         assert!((p99 - 99.0).abs() < 0.1, "p99 was {}", p99);
         assert!((t.min_ms() - 1.0).abs() < 0.01, "min was {}", t.min_ms());
         assert!((t.max_ms() - 100.0).abs() < 0.1, "max was {}", t.max_ms());
         assert!((t.avg_ms() - 50.5).abs() < 0.1, "avg was {}", t.avg_ms());
-        assert_eq!(test_rtt_tracker().percentiles(), (0.0, 0.0, 0.0));
+        assert_eq!(test_rtt_tracker().percentiles(), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(test_rtt_tracker().format_rtt(), "-/-/-/- ms");
     }
 
