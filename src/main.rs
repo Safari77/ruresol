@@ -1057,6 +1057,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    if args.no_stdin && matches!(args.input.as_deref(), Some("-")) {
+        eprintln!("error: --input - conflicts with --no-stdin");
+        std::process::exit(1);
+    }
+
     // Validate numeric limits that would otherwise panic or silently produce no output.
     if args.concurrency == 0 {
         eprintln!("error: --concurrency must be at least 1");
