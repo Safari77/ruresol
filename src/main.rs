@@ -281,8 +281,10 @@ fn reserved_nets() -> &'static [IpNet] {
             "172.16.0.0/12",      // RFC1918 private
             "192.0.0.0/24",       // IETF protocol assignments
             "192.0.2.0/24",       // TEST-NET-1 (documentation)
+            "192.31.196.0/24",    // AS112
             "192.88.99.0/24",     // 6to4 relay anycast
             "192.168.0.0/16",     // RFC1918 private
+            "192.175.48.0/24",    // AS 112§
             "198.18.0.0/15",      // benchmarking
             "198.51.100.0/24",    // TEST-NET-2 (documentation)
             "203.0.113.0/24",     // TEST-NET-3 (documentation)
@@ -294,6 +296,8 @@ fn reserved_nets() -> &'static [IpNet] {
             "::1/128",       // loopback
             "::ffff:0:0/96", // IPv4-mapped
             "100::/64",      // discard-only
+            "2001:2::/48",   // benchmarking
+            "2001:20::/28",  // ORCHIDv2
             "2001:db8::/32", // documentation
             "fc00::/7",      // unique local (ULA)
             "fe80::/10",     // link-local
