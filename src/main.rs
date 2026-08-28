@@ -114,7 +114,7 @@ struct Args {
     /// Output a single JSON array document for the whole run, instead of the
     /// line-delimited objects produced by --json. With --stats the array is wrapped
     /// as {"results": [...], "stats": {...}}.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     json_array: bool,
 
     /// Only show IP-valued records contained in this CIDR (e.g. 10.0.0.0/8 or
