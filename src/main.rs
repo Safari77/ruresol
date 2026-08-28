@@ -748,20 +748,26 @@ impl RecordEntry {
 /// different from the answer's — must not be reported as the record's TTL. The TTL
 /// is the smallest one among the records that `f` kept, or None when `include_ttl`
 /// is false or nothing matched.
-fn collect_records<'a, I, F>(answers: I, include_ttl: bool, f: F) -> (Vec<RecordEntry>, Option<u32>)
+fn collect_records<'a, I, F>(
+    answers: I,
+    include_ttl: bool,
+    f: F,
+) -> (Vec<RecordEntry>, Vec<u32>, Option<u32>)
 where
     I: IntoIterator<Item = &'a Record>,
     F: Fn(&RData) -> Option<RecordEntry>,
 {
     let mut records = Vec::new();
+    let mut ttls = Vec::new();
     let mut ttl: Option<u32> = None;
     for r in answers {
         if let Some(entry) = f(&r.data) {
             records.push(entry);
+            ttls.push(r.ttl);
             ttl = Some(ttl.map_or(r.ttl, |t| t.min(r.ttl)));
         }
     }
-    (records, if include_ttl { ttl } else { None })
+    (records, ttls, if include_ttl { ttl } else { None })
 }
 
 /// Unified structure for handling outputs
@@ -790,6 +796,12 @@ struct LookupResult {
     status: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     records: Vec<RecordEntry>,
+    /// TTL of each entry in `records`, same order. Exists so `print` can
+    /// recompute the reported `ttl` over only the records that survive
+    /// --match-cidr / --exclude-private filtering. Invariant: always the same
+    /// length as `records`.
+    #[serde(skip_serializing)]
+    record_ttls: Vec<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ttl: Option<u32>,
 }
@@ -876,26 +888,32 @@ impl LookupResult {
 
         // IP-based record filters (--match-cidr / --exclude-private)
         let active = filter.ip_filters_active();
-        let filtered: Vec<RecordEntry>;
+        let filtered_entries: Vec<RecordEntry>;
+        let filtered_ttls: Vec<u32>;
         let records: &[RecordEntry] = if active {
-            filtered = self
-                .records
-                .iter()
-                .filter(|r| filter.record_passes(r.value_str()))
-                .cloned()
-                .collect();
+            let mut entries = Vec::new();
+            let mut ttls = Vec::new();
+            for (i, r) in self.records.iter().enumerate() {
+                if filter.record_passes(r.value_str()) {
+                    entries.push(r.clone());
+                    // record_ttls matches records 1:1, but index defensively
+                    if let Some(t) = self.record_ttls.get(i) {
+                        ttls.push(*t);
+                    }
+                }
+            }
+            filtered_entries = entries;
+            filtered_ttls = ttls;
             if self.records.is_empty() {
-                // No records to begin with (error/NXDOMAIN/NODATA): --match-cidr can
-                // never match, so suppress; exclude-private alone keeps the status.
                 if !filter.match_cidrs.is_empty() {
                     return;
                 }
-            } else if filtered.is_empty() {
-                // Had records, but none survived the filter -> suppress the result.
+            } else if filtered_entries.is_empty() {
                 return;
             }
-            &filtered
+            &filtered_entries
         } else {
+            filtered_ttls = Vec::new();
             &self.records
         };
 
@@ -931,8 +949,14 @@ impl LookupResult {
         let res = if cfg.json {
             // Serialize with the filtered records (clone only when filtering changed them)
             let json_str = if active && records.len() != self.records.len() {
+                // Recompute the ttl over the surviving records only; the stored
+                // one is the min over all answers, including dropped ones.
+                // With --ttl off, self.ttl is None and this is a no-op.
                 let mut tmp = self.clone();
+                let new_ttl = self.ttl.and(filtered_ttls.iter().copied().min());
                 tmp.records = records.to_vec();
+                tmp.record_ttls = filtered_ttls;
+                tmp.ttl = new_ttl;
                 serde_json::to_string(&tmp)
             } else {
                 serde_json::to_string(self)
@@ -1490,6 +1514,7 @@ fn lookup_error(input: String, qt_lower: String, e: &NetError) -> LookupResult {
         timed_out: is_timeout_error(e),
         measured_rtt: None,
         status: classify_resolve_error(e), // Now consumes the generated String
+        record_ttls: vec![],
         records: vec![],
         ttl: None,
     }
@@ -1500,6 +1525,7 @@ fn lookup_success(
     input: String,
     qt_lower: String,
     records: Vec<RecordEntry>,
+    record_ttls: Vec<u32>,
     ttl: Option<u32>,
 ) -> LookupResult {
     LookupResult {
@@ -1507,7 +1533,6 @@ fn lookup_success(
         punycode: None,
         query_type: qt_lower,
         is_success: !records.is_empty(),
-        // A result only exists here because a response came back, so it was measured.
         timed_out: false,
         measured_rtt: None,
         status: if records.is_empty() {
@@ -1516,6 +1541,7 @@ fn lookup_success(
             "SUCCESS".to_string()
         },
         records,
+        record_ttls,
         ttl,
     }
 }
@@ -1584,29 +1610,29 @@ async fn typed_lookup(
     match query_type {
         "A" => match resolver.ipv4_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::A(a) => Some(RecordEntry::Simple(a.0.to_string())),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "AAAA" => match resolver.ipv6_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::AAAA(a) => Some(RecordEntry::Simple(a.0.to_string())),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "MX" => match resolver.mx_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::MX(mx) => Some(RecordEntry::WithPriority {
                             priority: mx.preference,
@@ -1614,35 +1640,35 @@ async fn typed_lookup(
                         }),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "NS" => match resolver.ns_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::NS(ns) => Some(RecordEntry::Simple(ns.0.to_string())),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "TXT" => match resolver.txt_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::TXT(txt) => Some(RecordEntry::Simple(txt.to_string())),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "SOA" => match resolver.soa_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::SOA(soa) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {} {} {} {}",
@@ -1656,13 +1682,13 @@ async fn typed_lookup(
                         ))),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
         "SRV" => match resolver.srv_lookup(input.as_str()).await {
             Ok(lookup) => {
-                let (records, ttl) =
+                let (records, ttls, ttl) =
                     collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                         RData::SRV(srv) => Some(RecordEntry::Simple(format!(
                             "{} {} {} {}",
@@ -1670,7 +1696,7 @@ async fn typed_lookup(
                         ))),
                         _ => None,
                     });
-                lookup_success(input, qt_lower, records, ttl)
+                lookup_success(input, qt_lower, records, ttls, ttl)
             }
             Err(e) => lookup_error(input, qt_lower, &e),
         },
@@ -1686,7 +1712,7 @@ async fn typed_lookup(
                     Ok(lookup) => {
                         let rev_elapsed = rev_start.elapsed();
                         // --ttl applies to reverse lookups too; it used to be dropped here.
-                        let (records, ttl) =
+                        let (records, ttls, ttl) =
                             collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                                 RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
                                 _ => None,
@@ -1727,7 +1753,8 @@ async fn typed_lookup(
                         }
 
                         let label = if any_match { "ptrmatch" } else { "ptr" };
-                        let mut result = lookup_success(input, label.to_string(), records, ttl);
+                        let mut result =
+                            lookup_success(input, label.to_string(), records, ttls, ttl);
                         if any_match {
                             result.status = "PTRMATCH".to_string();
                         }
@@ -1740,12 +1767,12 @@ async fn typed_lookup(
                 // Not an IP — do a generic PTR lookup (no forward-confirm possible)
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
-                        let (records, ttl) =
+                        let (records, ttls, ttl) =
                             collect_records(lookup.answers().iter(), include_ttl, |d| {
                                 (d.record_type() == RecordType::PTR)
                                     .then(|| RecordEntry::Simple(d.to_string()))
                             });
-                        lookup_success(input, "ptr".to_string(), records, ttl)
+                        lookup_success(input, "ptr".to_string(), records, ttls, ttl)
                     }
                     Err(e) => lookup_error(input, "ptr".to_string(), &e),
                 }
@@ -1758,12 +1785,12 @@ async fn typed_lookup(
                 match resolver.reverse_lookup(rev_name).await {
                     Ok(lookup) => {
                         // --ttl applies to reverse lookups too; it used to be dropped here.
-                        let (records, ttl) =
+                        let (records, ttls, ttl) =
                             collect_records(lookup.answers().iter(), include_ttl, |d| match d {
                                 RData::PTR(ptr) => Some(RecordEntry::Simple(ptr.0.to_string())),
                                 _ => None,
                             });
-                        lookup_success(input, qt_lower, records, ttl)
+                        lookup_success(input, qt_lower, records, ttls, ttl)
                     }
                     Err(e) => lookup_error(input, qt_lower, &e),
                 }
@@ -1771,12 +1798,12 @@ async fn typed_lookup(
                 // Not an IP — do a generic PTR lookup on the hostname
                 match resolver.lookup(input.as_str(), RecordType::PTR).await {
                     Ok(lookup) => {
-                        let (records, ttl) =
+                        let (records, ttls, ttl) =
                             collect_records(lookup.answers().iter(), include_ttl, |d| {
                                 (d.record_type() == RecordType::PTR)
                                     .then(|| RecordEntry::Simple(d.to_string()))
                             });
-                        lookup_success(input, qt_lower, records, ttl)
+                        lookup_success(input, qt_lower, records, ttls, ttl)
                     }
                     Err(e) => lookup_error(input, qt_lower, &e),
                 }
@@ -1788,12 +1815,12 @@ async fn typed_lookup(
             let record_type = to_record_type(query_type);
             match resolver.lookup(input.as_str(), record_type).await {
                 Ok(lookup) => {
-                    let (records, ttl) =
+                    let (records, ttls, ttl) =
                         collect_records(lookup.answers().iter(), include_ttl, |d| {
                             (d.record_type() == record_type)
                                 .then(|| RecordEntry::Simple(d.to_string()))
                         });
-                    lookup_success(input, qt_lower, records, ttl)
+                    lookup_success(input, qt_lower, records, ttls, ttl)
                 }
                 Err(e) => lookup_error(input, qt_lower, &e),
             }
@@ -1828,6 +1855,7 @@ mod tests {
             } else {
                 "SUCCESS".to_string()
             },
+            record_ttls: vec![0; records.len()],
             records,
             ttl: None,
         }
