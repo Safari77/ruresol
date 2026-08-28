@@ -59,7 +59,7 @@ struct Args {
     #[arg(short = 'j', long)]
     json: bool,
 
-    /// Rate limit queries per second (QPS)
+    /// Rate limit queries per second (QPS) — PTRMATCH might cause limit to exceed
     #[arg(long)]
     rate_limit: Option<u64>,
 
@@ -453,7 +453,7 @@ impl RttTracker {
         )
     }
 
-    /// (p50, p95, p99) latency percentiles in milliseconds, over answered queries only.
+    /// (p50, p90, p95, p99) latency percentiles in milliseconds, over answered queries only.
     /// These are recorded values rather than interpolated ones, accurate to the
     /// histogram's configured resolution.
     fn percentiles(&self) -> (f64, f64, f64, f64) {
