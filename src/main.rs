@@ -1012,8 +1012,8 @@ fn emit_raw(pb: &Option<ProgressBar>, s: &str) {
     let write_it = || {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        let _ = write!(out, "{}", s);
-        let _ = out.flush();
+        handle_write(write!(out, "{}", s));
+        handle_write(out.flush());
     };
     match pb {
         Some(pb) => pb.suspend(write_it),
@@ -1460,10 +1460,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A dropped write here silently truncates the JSON document while still exiting
         // 0, so it goes through the same error handling as the result lines.
         handle_write(write!(std::io::stdout().lock(), "{}", suffix));
+        handle_write(std::io::stdout().flush());
     } else if args.stats {
         if args.json {
             use std::io::Write;
             handle_write(writeln!(std::io::stdout().lock(), "{}", stats.format_summary_json()));
+            handle_write(std::io::stdout().flush());
         } else {
             eprintln!("{}", stats.format_summary());
         }
