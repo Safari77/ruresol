@@ -268,6 +268,9 @@ fn max_trackable_rtt_us(timeout_ms: u64, attempts: usize, nameservers: usize) ->
 
 /// Well-known private / reserved IPv4 and IPv6 ranges. Built once and reused.
 /// These are the data behind --exclude-private; ipnet does the actual matching.
+/// Note: `::ffff:0:0/96` (IPv4-mapped IPv6) is deliberately omitted here because
+/// `is_reserved_ip` canonicalizes mapped addresses to IPv4 first, avoiding false
+/// positives on public IPv4-mapped addresses like `::ffff:8.8.8.8`.
 fn reserved_nets() -> &'static [IpNet] {
     static NETS: OnceLock<Vec<IpNet>> = OnceLock::new();
     NETS.get_or_init(|| {
@@ -282,9 +285,10 @@ fn reserved_nets() -> &'static [IpNet] {
             "192.0.0.0/24",       // IETF protocol assignments
             "192.0.2.0/24",       // TEST-NET-1 (documentation)
             "192.31.196.0/24",    // AS112
+            "192.52.193.0/24",    // AMT (RFC7450)
             "192.88.99.0/24",     // 6to4 relay anycast
             "192.168.0.0/16",     // RFC1918 private
-            "192.175.48.0/24",    // AS 112§
+            "192.175.48.0/24",    // AS112
             "198.18.0.0/15",      // benchmarking
             "198.51.100.0/24",    // TEST-NET-2 (documentation)
             "203.0.113.0/24",     // TEST-NET-3 (documentation)
@@ -292,16 +296,16 @@ fn reserved_nets() -> &'static [IpNet] {
             "240.0.0.0/4",        // reserved / future use
             "255.255.255.255/32", // limited broadcast
             // IPv6
-            "::/128",        // unspecified
-            "::1/128",       // loopback
-            "::ffff:0:0/96", // IPv4-mapped
-            "100::/64",      // discard-only
-            "2001:2::/48",   // benchmarking
-            "2001:20::/28",  // ORCHIDv2
-            "2001:db8::/32", // documentation
-            "fc00::/7",      // unique local (ULA)
-            "fe80::/10",     // link-local
-            "ff00::/8",      // multicast
+            "::/128",         // unspecified
+            "::1/128",        // loopback
+            "64:ff9b:1::/48", // local-use IPv4/IPv6 translation (RFC8215)
+            "100::/64",       // discard-only
+            "2001:2::/48",    // benchmarking
+            "2001:20::/28",   // ORCHIDv2
+            "2001:db8::/32",  // documentation
+            "fc00::/7",       // unique local (ULA)
+            "fe80::/10",      // link-local
+            "ff00::/8",       // multicast
         ];
         RAW.iter().map(|s| s.parse::<IpNet>().expect("valid reserved CIDR")).collect()
     })
@@ -309,7 +313,8 @@ fn reserved_nets() -> &'static [IpNet] {
 
 /// True if the address falls in any private/reserved range (used by --exclude-private).
 fn is_reserved_ip(ip: IpAddr) -> bool {
-    reserved_nets().iter().any(|net| net.contains(&ip))
+    let canonical = ip.to_canonical();
+    reserved_nets().iter().any(|net| net.contains(&canonical))
 }
 
 /// Generate a random 12-char DNS label, used to probe a zone for wildcard responses.
@@ -325,21 +330,22 @@ fn normalize_host(h: &str) -> String {
     to_punycode(h.trim()).trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Find the longest parent domain in `wildcards` that `host` belongs to, if any.
+/// Find the longest parent domain in `wildcards` that `host` is a strict subdomain of, if any.
 /// `host` is expected to already be normalized via `normalize_host`.
+/// Note: A wildcard record `*.parent` only synthesizes records for strict subdomains of `parent`
+/// (`host.len() > parent.len()`), never for the apex `parent` itself.
 fn find_wildcard_parent<'a>(
     host: &str,
     wildcards: &'a HashMap<String, HashSet<IpAddr>>,
 ) -> Option<&'a HashSet<IpAddr>> {
     let mut best: Option<(&str, &HashSet<IpAddr>)> = None;
     for (parent, set) in wildcards {
-        // exact match or a strict subdomain (the leading dot avoids "notexample.com"
-        // matching parent "example.com"). Checked without building a ".parent" String,
+        // Strict subdomain check (the leading dot avoids "notexample.com" matching
+        // parent "example.com"). Checked without building a ".parent" String,
         // since this runs once per parent for every single result.
-        let matches = host == parent
-            || (host.len() > parent.len()
-                && host.ends_with(parent.as_str())
-                && host.as_bytes()[host.len() - parent.len() - 1] == b'.');
+        let matches = host.len() > parent.len()
+            && host.ends_with(parent.as_str())
+            && host.as_bytes()[host.len() - parent.len() - 1] == b'.';
         if matches && best.is_none_or(|(bp, _)| parent.len() > bp.len()) {
             best = Some((parent.as_str(), set));
         }
@@ -406,7 +412,7 @@ impl RttTracker {
         // discernible value so the sample still counts. saturating_record clamps the
         // other end, keeping an outlier beyond the bound in the histogram as the max
         // rather than discarding it.
-        let us = (duration.as_micros() as u64).max(RTT_LOW_US);
+        let us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX).max(RTT_LOW_US);
         self.hist.saturating_record(us);
     }
 
@@ -823,11 +829,13 @@ impl OutputFilter {
     /// Decide whether a single record value passes the IP-based filters.
     fn record_passes(&self, value: &str) -> bool {
         match value.parse::<IpAddr>() {
-            Ok(ip) => {
+            Ok(raw_ip) => {
+                let ip = raw_ip.to_canonical();
                 if self.exclude_private && is_reserved_ip(ip) {
                     return false;
                 }
-                if !self.match_cidrs.is_empty() && !self.match_cidrs.iter().any(|n| n.contains(&ip))
+                if !self.match_cidrs.is_empty()
+                    && !self.match_cidrs.iter().any(|n| n.contains(&ip) || n.contains(&raw_ip))
                 {
                     return false;
                 }
@@ -870,7 +878,13 @@ struct PrintCfg {
 }
 
 impl LookupResult {
-    fn print(&self, cfg: &PrintCfg, filter: &OutputFilter, array_started: &AtomicBool) {
+    fn print(
+        &self,
+        cfg: &PrintCfg,
+        filter: &OutputFilter,
+        array_started: &AtomicBool,
+        pb: &Option<ProgressBar>,
+    ) {
         use std::io::Write;
 
         // Apply --show-only filter: if filters are set, skip non-matching results
@@ -941,7 +955,10 @@ impl LookupResult {
                         writeln!(out, "{}", value)
                     }
                 };
-                handle_write(res);
+                if let Err(e) = res {
+                    drop(out);
+                    handle_write_err(e, pb);
+                }
             }
             return;
         }
@@ -999,7 +1016,10 @@ impl LookupResult {
             writeln!(out, "{}:{}", name, self.status)
         };
 
-        handle_write(res);
+        if let Err(e) = res {
+            drop(out);
+            handle_write_err(e, pb);
+        }
     }
 }
 
@@ -1012,8 +1032,10 @@ fn emit_raw(pb: &Option<ProgressBar>, s: &str) {
     let write_it = || {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        handle_write(write!(out, "{}", s));
-        handle_write(out.flush());
+        if let Err(e) = write!(out, "{}", s).and_then(|_| out.flush()) {
+            drop(out);
+            handle_write_err(e, pb);
+        }
     };
     match pb {
         Some(pb) => pb.suspend(write_it),
@@ -1021,18 +1043,26 @@ fn emit_raw(pb: &Option<ProgressBar>, s: &str) {
     }
 }
 
-/// Handle the result of a stdout write. A broken pipe (the downstream reader closed,
+/// Handle a stdout write error. A broken pipe (the downstream reader closed,
 /// e.g. `... | head`) is an expected, clean termination -> exit(0). Any other write
 /// error (e.g. disk full when redirected to a file) is a real failure -> exit(1) so
-/// callers can detect it. This relies on SIGPIPE being ignored (Rust's default), so a
-/// broken pipe surfaces here as an Err rather than a fatal signal.
+/// callers can detect it. Clears any active progress bar before exiting so the
+/// terminal is not left with half-drawn artifacts.
+fn handle_write_err(e: std::io::Error, pb: &Option<ProgressBar>) -> ! {
+    if let Some(bar) = pb {
+        bar.finish_and_clear();
+    }
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("error writing to stdout: {}", e);
+    std::process::exit(1);
+}
+
+/// Convenience wrapper around `handle_write_err` when no progress bar is active.
 fn handle_write(res: std::io::Result<()>) {
     if let Err(e) = res {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
-        eprintln!("error writing to stdout: {}", e);
-        std::process::exit(1);
+        handle_write_err(e, &None);
     }
 }
 
@@ -1060,10 +1090,10 @@ async fn count_input_lines(path: &str) -> Option<u64> {
         if bytes_read == 0 {
             break; // EOF
         }
-        if let Ok(line_str) = std::str::from_utf8(&buf) {
-            if clean_input_line(line_str).is_some() {
-                count += 1;
-            }
+        if let Ok(line_str) = std::str::from_utf8(&buf)
+            && clean_input_line(line_str).is_some()
+        {
+            count += 1;
         }
         buf.clear();
     }
@@ -1168,7 +1198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Learn wildcard address sets up front (if --wildcard-filter FILE is given), so
     // results can be filtered against them during the main resolution pass.
     let wildcards: HashMap<String, HashSet<IpAddr>> = if let Some(path) = &args.wildcard_filter {
-        match learn_wildcards(&resolver, path, 3).await {
+        match learn_wildcards(&resolver, path, 3, args.concurrency).await {
             Ok(map) => {
                 if !map.is_empty() {
                     eprintln!("wildcard: detected wildcards for {} parent domain(s)", map.len());
@@ -1218,7 +1248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Collect extra domains passed after --
     let mut extra_domains: Vec<String> =
-        args.extra.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        args.extra.iter().filter_map(|s| clean_input_line(s).map(str::to_string)).collect();
 
     // Knuth (Fisher-Yates) shuffle of -- arguments when --shuf is set
     if args.shuf && extra_domains.len() > 1 {
@@ -1253,7 +1283,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Initialize statistics tracking (used by --progress and --stats)
+    // Initialize statistics tracking (used by --progress and --stats) right before
+    // resolution starts so file pre-scanning or wildcard probing does not skew elapsed/QPS.
     let stats = Arc::new(QueryStats::new(expected_total, max_rtt_us));
 
     // Initialize progress bar (if --progress). The bar tracks completed queries. When the
@@ -1300,10 +1331,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Check if valid UTF-8. If valid, process. If not, we basically ignore (skip) it.
-                if let Ok(line_str) = std::str::from_utf8(&buf) {
-                    if let Some(line) = clean_input_line(line_str) {
-                        yield line.to_string();
-                    }
+                if let Ok(line_str) = std::str::from_utf8(&buf)
+                    && let Some(line) = clean_input_line(line_str)
+                {
+                    yield line.to_string();
                 }
                 buf.clear();
             }
@@ -1363,9 +1394,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stats = stats_task.clone();
         let pb = pb_task.clone();
 
-        stats.submitted.fetch_add(1, Ordering::Relaxed);
-
         async move {
+            let sub = stats.submitted.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(ref pb) = pb
+                && stats.expected_total.is_none()
+            {
+                pb.set_length(sub);
+            }
+
             let start = Instant::now();
             let mut result = typed_lookup(input, resolver, &query_type, include_ttl).await;
             let elapsed = start.elapsed();
@@ -1415,10 +1451,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let filter = output_filter.clone();
                 let astate = array_started.clone();
                 async move {
-                    if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(&cfg, &filter, &astate));
+                    if let Some(ref bar) = pb {
+                        bar.suspend(|| result.print(&cfg, &filter, &astate, &pb));
                     } else {
-                        result.print(&cfg, &filter, &astate);
+                        result.print(&cfg, &filter, &astate, &pb);
                     }
                 }
             })
@@ -1432,10 +1468,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let filter = output_filter.clone();
                 let astate = array_started.clone();
                 async move {
-                    if let Some(ref pb) = pb {
-                        pb.suspend(|| result.print(&cfg, &filter, &astate));
+                    if let Some(ref bar) = pb {
+                        bar.suspend(|| result.print(&cfg, &filter, &astate, &pb));
                     } else {
-                        result.print(&cfg, &filter, &astate);
+                        result.print(&cfg, &filter, &astate, &pb);
                     }
                 }
             })
@@ -1558,40 +1594,55 @@ async fn learn_wildcards(
     resolver: &TokioResolver,
     path: &str,
     probes: usize,
+    concurrency: usize,
 ) -> std::io::Result<HashMap<String, HashSet<IpAddr>>> {
     let content = tokio::fs::read_to_string(path).await?;
 
-    // Normalize + dedup parent domains
+    // Normalize + dedup parent domains (using clean_input_line to handle BOMs and '#' comments)
     let parents: Vec<String> = content
         .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(clean_input_line)
         .map(normalize_host)
         .filter(|p| !p.is_empty())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
 
+    let results: Vec<(String, HashSet<IpAddr>)> = futures::stream::iter(parents)
+        .map(|parent| {
+            let resolver = resolver.clone();
+            async move {
+                let mut set = HashSet::new();
+                for _ in 0..probes {
+                    let probe = format!("{}.{}", random_label(), parent);
+                    let (v4_res, v6_res) = tokio::join!(
+                        resolver.ipv4_lookup(probe.as_str()),
+                        resolver.ipv6_lookup(probe.as_str())
+                    );
+                    if let Ok(lookup) = v4_res {
+                        for r in lookup.answers() {
+                            if let RData::A(a) = &r.data {
+                                set.insert(IpAddr::V4(a.0));
+                            }
+                        }
+                    }
+                    if let Ok(lookup) = v6_res {
+                        for r in lookup.answers() {
+                            if let RData::AAAA(a) = &r.data {
+                                set.insert(IpAddr::V6(a.0));
+                            }
+                        }
+                    }
+                }
+                (parent, set)
+            }
+        })
+        .buffer_unordered(concurrency.max(1))
+        .collect()
+        .await;
+
     let mut map = HashMap::new();
-    for parent in parents {
-        let mut set = HashSet::new();
-        for _ in 0..probes {
-            let probe = format!("{}.{}", random_label(), parent);
-            if let Ok(lookup) = resolver.ipv4_lookup(probe.as_str()).await {
-                for r in lookup.answers() {
-                    if let RData::A(a) = &r.data {
-                        set.insert(IpAddr::V4(a.0));
-                    }
-                }
-            }
-            if let Ok(lookup) = resolver.ipv6_lookup(probe.as_str()).await {
-                for r in lookup.answers() {
-                    if let RData::AAAA(a) = &r.data {
-                        set.insert(IpAddr::V6(a.0));
-                    }
-                }
-            }
-        }
+    for (parent, set) in results {
         // Only keep parents that actually exhibit a wildcard
         if !set.is_empty() {
             map.insert(parent, set);
@@ -2066,10 +2117,10 @@ mod tests {
         {
             assert!(is_reserved_ip(ip(s)), "{} should be reserved", s);
         }
-        for s in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "203.0.114.1"] {
+        for s in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "203.0.114.1", "::ffff:8.8.8.8"] {
             assert!(!is_reserved_ip(ip(s)), "{} should be public", s);
         }
-        for s in ["::1", "fe80::1", "fc00::1", "fd12:3456::1", "2001:db8::1"] {
+        for s in ["::1", "fe80::1", "fc00::1", "fd12:3456::1", "2001:db8::1", "::ffff:10.0.0.1"] {
             assert!(is_reserved_ip(ip(s)), "{} should be reserved", s);
         }
         assert!(!is_reserved_ip(ip("2606:4700:4700::1111")));
@@ -2085,6 +2136,7 @@ mod tests {
         };
         assert!(f.ip_filters_active());
         assert!(f.record_passes("10.1.2.3"));
+        assert!(f.record_passes("::ffff:10.1.2.3"));
         assert!(!f.record_passes("8.8.8.8"));
         assert!(!f.record_passes("mail.example.com")); // non-IP can't satisfy --match-cidr
     }
@@ -2162,7 +2214,10 @@ mod tests {
         m.insert("sub.example.com".into(), HashSet::from([ip("5.6.7.8")]));
         assert!(find_wildcard_parent("a.sub.example.com", &m).unwrap().contains(&ip("5.6.7.8")));
         assert!(find_wildcard_parent("foo.example.com", &m).unwrap().contains(&ip("1.2.3.4")));
-        assert!(find_wildcard_parent("example.com", &m).is_some());
+        // Apex domain itself is not a subdomain of its own wildcard, but sub.example.com
+        // is a subdomain of example.com
+        assert!(find_wildcard_parent("example.com", &m).is_none());
+        assert!(find_wildcard_parent("sub.example.com", &m).unwrap().contains(&ip("1.2.3.4")));
         assert!(find_wildcard_parent("notexample.com", &m).is_none());
         assert!(find_wildcard_parent("other.org", &m).is_none());
         // shorter than the parent, and a suffix that isn't on a label boundary
@@ -2190,6 +2245,8 @@ mod tests {
 
         // A answer that only returns the wildcard IP -> filtered
         assert!(f.is_wildcard_result(&mk_result("foo.example.com", "a", &["1.2.3.4"])));
+        // Apex domain with the same IP -> kept (not synthesized by *.example.com)
+        assert!(!f.is_wildcard_result(&mk_result("example.com", "a", &["1.2.3.4"])));
         // A answer with a non-wildcard IP -> kept
         assert!(!f.is_wildcard_result(&mk_result("foo.example.com", "a", &["1.2.3.4", "9.9.9.9"])));
         // Not under a known parent -> kept
